@@ -3,3 +3,5 @@ ssh_authorized_keys:
   - @SSH_PUBKEY@
 growpart: {mode: "off"}
 resize_rootfs: false
+runcmd:
+  - [ /usr/local/sbin/ramboot-report ]

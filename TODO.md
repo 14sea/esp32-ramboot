@@ -5,9 +5,9 @@ Status of each task: **open**, **in work**, **done**, or **blocked**.
 | No. | Task | Status |
 |---|---|---|
 | 1 | Test on a real computer | blocked: no target computer at this location |
-| 1a | Test of the download from `cloud-images.ubuntu.com` in Stage 1 | open |
-| 2 | Feedback channel from the target computer to the host computer | open |
-| 3 | Change of the configuration without a new boot disk image | open |
+| 1a | Test of the download from `cloud-images.ubuntu.com` in Stage 1 | in work: 16 MB of 385 MB tested, 180 kB/s at the test location |
+| 2 | Feedback channel from the target computer to the host computer | done on 2026-11-25 |
+| 3 | Change of the configuration without a new boot disk image | in work: download location, kernel parameters, and wait time are done. The SSH key is open |
 | 4 | Operation with Secure Boot on | open |
 | 5 | Installation of an operating system on the disk of the target computer | open |
 | 6 | Wireless network and download of drivers on demand | blocked: refer to the task |

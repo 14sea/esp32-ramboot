@@ -10,6 +10,9 @@
                                      絕對座標滑鼠，X Y 是 HID 座標 0–32767
   kvm.py mode [hid|hid+msc|msc] [save]   查詢/切換 USB 身分（鍵鼠 / 鍵鼠+啟動盤 / 只有啟動盤）；save = 存為開機模式
   kvm.py wait <文字> [秒] [--then "<命令>"]    等含這段文字的事件，等到後可緊接著發一條命令
+  kvm.py target [clear]              目標機報來的進度和信息（Stage-1 的每一步、IP、機器型號……），主機不在線時收到的也在
+  kvm.py cfg [set key=value | del key | clear]   存在設備裡、目標機啟動時讀的配置：
+                                     base=<地址> 換下載站；cmdline=<參數> 追加內核參數（ramboot.console=1 = 控制台自動登入）
   kvm.py release | log | caps | state | dfu | reboot
   kvm.py raw '<cmd> [args]'          發任意帶序號命令
   kvm.py bridge @status              橋本地命令
@@ -230,6 +233,8 @@ def main():
         elif a.cmd in ("move", "click", "scroll", "drag"):
             cmd = a.cmd + " " + " ".join(a.args)
             timeout += 3
+        elif a.cmd in ("target", "cfg"):    # target [clear]；cfg [set key=value | del key | clear]
+            cmd = (a.cmd + " " + " ".join(a.args)).strip()
         elif a.cmd in ("release", "log", "caps", "state", "dfu", "reboot"):
             cmd = a.cmd
         else:

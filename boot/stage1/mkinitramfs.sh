@@ -14,6 +14,7 @@ APPLETS="sh mount umount cat echo ls ip udhcpc wget sha256sum awk cut sleep stat
     for a in $APPLETS; do echo "slink /bin/$a busybox 777 0 0"; done
     echo "file /bin/s1tool $P/s1tool 755 0 0"
     echo "file /init $P/rootfs/init 755 0 0"
+    echo "file /bin/r $P/rootfs/bin/r 755 0 0"
     for f in udhcpc.sh; do echo "file /etc/$f $P/rootfs/etc/$f 755 0 0"; done
     for f in stage1.version; do echo "file /etc/$f $P/rootfs/etc/$f 644 0 0"; done
 } > initramfs.list

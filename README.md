@@ -14,15 +14,19 @@ The sequence on the target computer is:
 
 1. The UEFI firmware starts Stage 1 from the USB disk.
    Stage 1 is a Linux kernel with BusyBox (3.4 MB).
-2. Stage 1 gets an IP address through the wired network adapter.
+2. Stage 1 gets an IP address through a wired network adapter.
 3. Stage 1 downloads Ubuntu Server (385 MB) and does a check of the SHA-256 values.
 4. Stage 1 starts Ubuntu Server with `kexec`.
 5. Ubuntu Server 26.04 operates in RAM.
    It does not write data to the disks of the target computer.
 
+Stage 1 and Ubuntu Server send their progress to the device board through the USB disk.
+The device board sends this data to the host computer.
+
 ## Limits
 
 - The target computer must have a wired network adapter from Intel, Realtek, Broadcom, or Atheros.
+  A USB network adapter (ASIX, Realtek, CDC) or a telephone with USB tethering is also satisfactory.
   Stage 1 has no drivers for wireless network adapters.
 - The network must have a DHCP server and access to the download location.
 - The target computer must start in UEFI mode. Secure Boot must be off.
@@ -137,6 +141,8 @@ The two boards pair at the first connection. The pairing stays in the flash memo
 | `kvm.py scroll N` | Turns the mouse wheel |
 | `kvm.py mode [hid\|hid+msc\|msc] [save]` | Shows or changes the USB mode |
 | `kvm.py wait <text> [seconds]` | Waits for an event from the device board |
+| `kvm.py target` | Shows the progress data that the target computer sent |
+| `kvm.py cfg [set key=value \| del key \| clear]` | Shows or changes the configuration for the target computer |
 | `kvm.py log` | Shows the log of the device board |
 | `kvm.py dfu` | Puts the device board into download mode |
 
@@ -144,6 +150,21 @@ The default USB mode is `hid+msc`: keyboard, mouse, and boot disk.
 Use the mode `msc` if the UEFI firmware does not start from the default mode.
 
 If the link to the host computer stops, the device board releases all keys in 3 seconds.
+
+The device board keeps the configuration in its flash memory. Stage 1 reads it at each start.
+
+| Key | Function |
+|---|---|
+| `base=<address>` | Download location. The SHA-256 values in the boot disk image stay applicable |
+| `cmdline=<parameters>` | More parameters for the Ubuntu kernel |
+| `netwait=<seconds>` | Time that Stage 1 waits for a network adapter |
+
+The parameter `ramboot.console=1` logs in the user `root` on the first console of Ubuntu Server.
+Then you can type commands with `kvm.py type`.
+The command `r <command>` on the target computer sends the output of `<command>` to the host computer.
+
+> **CAUTION:** Use `ramboot.console=1` only when it is necessary.
+> A person who has access to the keyboard of the target computer gets `root` access.
 
 ### 5. Do a test in QEMU
 
@@ -180,7 +201,8 @@ If the link to the host computer stops, the device board releases all keys in 3 
 4. Start the target computer.
 5. Select the USB disk `DIY S3 Boot Disk` in the boot menu.
    For example, `python3 tools/kvm.py repeat F12 15000 100` pushes F12 for 15 seconds.
-6. Get the IP address of the target computer from the DHCP server.
+6. Monitor the progress with `python3 tools/kvm.py wait "os up" 1800`.
+   Then `python3 tools/kvm.py target` shows the IP address of the target computer.
 7. Log in:
 
    ```sh
@@ -196,12 +218,15 @@ The author did these tests on 2026-11-25 with two boards and QEMU 8.2:
 - The host computer read the boot disk at 805 kB/s. The SHA-256 value was correct.
 - The target received the correct keys and mouse events.
 - The device board stopped the keys when the link stopped.
+- The host computer received the progress, the computer model, the IP address, and the disk list.
+- Stage 1 used the download location from the configuration of the device board.
+- With no network adapter, Stage 1 sent the failure. Commands that the host computer typed sent their output.
 - The firmware files and the boot disk image contain no paths or names of the host computer.
 
 The author did not do these tests:
 
 - Start of a real computer.
-- Download from `cloud-images.ubuntu.com` in Stage 1. The tests used a local HTTP server.
+- Full download from `cloud-images.ubuntu.com` in Stage 1. Only the first file (16 MB) was downloaded in a test.
 - First pairing of two new boards.
 
 ## Known problems

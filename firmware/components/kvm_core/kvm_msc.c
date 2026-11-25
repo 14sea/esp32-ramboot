@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "kvm_cmd.h"
 #include "kvm_hid.h"
+#include "kvm_target.h"
 #include "device/usbd_pvt.h"
 #include "tusb.h"
 
@@ -32,6 +33,9 @@ static struct {
     uint32_t inquiry, tur, other;       /* 收到的 SCSI 命令數，看主機有沒有在跟啟動盤說話 */
     uint8_t last_other;
 } s_st;
+/* 本次枚舉以來讀了多少。主機只是認盤、掃分區表時讀幾百 KB；讀過 1 MB 基本就是固件在加載 Stage-1 的內核 */
+static volatile uint32_t s_mount_bytes;
+#define BOOT_READ_HINT (1024 * 1024)
 
 /* 盤的大小取鏡像自己的大小，不是分區大小：GPT 的備份表頭必須在盤的最後一個扇區 */
 static uint32_t detect_blocks(void)
@@ -53,6 +57,7 @@ static uint32_t detect_blocks(void)
 void kvm_msc_init(void)
 {
     s_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "bootimg");
+    kvm_target_init();
     if (!s_part) { ESP_LOGW(TAG, "沒有 bootimg 分區"); return; }
     kvm_msc_rescan();
 }
@@ -66,7 +71,7 @@ uint32_t kvm_msc_rescan(void)
     return s_blocks;
 }
 
-void kvm_msc_bus_reset(void) { s_ejected = false; }
+void kvm_msc_bus_reset(void) { s_ejected = false; s_mount_bytes = 0; }
 
 void kvm_msc_info(char *buf, size_t len)
 {
@@ -147,6 +152,9 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
     s_st.last_us = t1;
     s_st.reads++;
     s_st.bytes += bufsize;
+    uint32_t before = s_mount_bytes;
+    s_mount_bytes = before + bufsize;
+    if (before < BOOT_READ_HINT && before + bufsize >= BOOT_READ_HINT) kvm_cmd_event("msc read_1mb");
     return (int32_t)bufsize;
 }
 
@@ -159,13 +167,27 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
 
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, uint16_t bufsize)
 {
-    (void)buffer; (void)bufsize;
     s_st.other++;
     s_st.last_other = scsi_cmd[0];
-    /* 廠商命令 FB 'B''O''O''T'：純 U 盤模式下沒有鍵盤燈暗號可用，留一條從目標機重燒的路 */
-    if (scsi_cmd[0] == 0xFB && memcmp(&scsi_cmd[1], "BOOT", 4) == 0) {
-        kvm_hid_reboot_to_download();
-        return 0;
+    /* 廠商命令：操作碼 FB + 四個字母 */
+    if (scsi_cmd[0] == 0xFB) {
+        /* BOOT（無數據）：純 U 盤模式下沒有鍵盤燈暗號可用，留一條從目標機重燒的路 */
+        if (memcmp(&scsi_cmd[1], "BOOT", 4) == 0) {
+            kvm_hid_reboot_to_download();
+            return 0;
+        }
+        /* TMSG（數據出）：目標機報進度。TinyUSB 收完數據才調到這裡，buffer 裡就是那段文本 */
+        if (memcmp(&scsi_cmd[1], "TMSG", 4) == 0) {
+            kvm_target_msg(buffer, bufsize);
+            return 0;
+        }
+        /* GCFG（數據入）：目標機讀配置。多帶一個結尾的 0，空配置時也有 1 字節可回（回 0 字節會被當成失敗） */
+        if (memcmp(&scsi_cmd[1], "GCFG", 4) == 0) {
+            if (bufsize < 2) return -1;
+            size_t n = kvm_target_cfg(buffer, bufsize - 1);
+            ((char *)buffer)[n] = '\0';
+            return (int32_t)(n + 1);
+        }
     }
     tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);         /* INVALID COMMAND OPERATION CODE */
     return -1;

@@ -1,0 +1,3 @@
+#!/bin/sh
+# r <命令…>：跑一條命令並把輸出報給主機。給「主機只能經藍牙鍵盤打字、看不到屏幕」的情況用
+exec /usr/local/sbin/ramboot-report run "$@"

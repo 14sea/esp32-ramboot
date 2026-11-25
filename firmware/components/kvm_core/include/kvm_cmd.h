@@ -5,7 +5,7 @@
 
 #include "esp_err.h"
 
-#define KVM_FW_VERSION "0.8"
+#define KVM_FW_VERSION "0.9"
 
 void kvm_cmd_init(void);
 

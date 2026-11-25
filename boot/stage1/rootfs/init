@@ -9,7 +9,10 @@ mount -t tmpfs -o size=90% tmpfs /tmp
 
 # 屏幕和串口（調試/虛擬機）都打一份
 say() { echo "[stage1] $*"; echo "[stage1] $*" > /dev/ttyS0; } 2>/dev/null
-fail() { say "FAILED: $*"; say "dropping to shell"; exec setsid cttyhack sh; }
+# 主機看不到這塊屏幕：關鍵的每一步另外經啟動盤那塊板子報給主機（"* target s1 …"），找到啟動盤之後才報得出去
+report() { [ -n "$BOOTDISK" ] && s1tool msg $BOOTDISK "s1 $*" 2>/dev/null; return 0; }
+sayr() { say "$*"; report "$*"; }
+fail() { say "FAILED: $*"; report "FAILED: $*"; say "dropping to shell"; exec setsid cttyhack sh; }
 
 S1_URL=
 S1_LOCAL_WAIT=12        # 先給目標機自己的網卡這麼多秒
@@ -44,9 +47,31 @@ while [ $t -lt 10 ] && [ -z "$BOOTDISK" ]; do
     done
     [ -z "$BOOTDISK" ] && { sleep 1; t=$((t + 1)); }
 done
+CFG_BASE=
+CFG_CMDLINE=
 if [ -n "$BOOTDISK" ]; then
     say "config copied from $BOOTDISK ($(ls /tmp/stage2 | tr '\n' ' '))"
+    echo $BOOTDISK > /tmp/bootdisk                  # 給 /bin/r 用
     [ -f /tmp/stage2/stage1.conf ] && . /tmp/stage2/stage1.conf
+    # 板子裡存的配置（主機經藍牙寫的）：只認下面幾個鍵，當數據讀，不當腳本執行
+    s1tool getcfg $BOOTDISK > /tmp/device.conf 2>/dev/null
+    while IFS='=' read -r k v; do
+        case "$k" in
+            base)    CFG_BASE=$v ;;
+            cmdline) CFG_CMDLINE=$v ;;
+            netwait) case "$v" in *[!0-9]*|'') ;; *) S1_USBNET_WAIT=$v ;; esac ;;   # 沒網時等多久（秒），給人去插網線/手機的時間
+        esac
+    done < /tmp/device.conf
+    DMI=/sys/class/dmi/id
+    report "stage1 $(cat /etc/stage1.version) mem=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)MB cpus=$(grep -c ^processor /proc/cpuinfo)"
+    report "hw $(cat $DMI/sys_vendor 2>/dev/null) / $(cat $DMI/product_name 2>/dev/null) / $(cat $DMI/product_version 2>/dev/null) bios $(cat $DMI/bios_version 2>/dev/null)"
+    # 網絡類的 PCI 設備和認領它的驅動：沒有驅動的那種（多半是無線網卡）一眼就能看出來
+    for p in /sys/bus/pci/devices/*; do
+        case "$(cat $p/class 2>/dev/null)" in 0x02*) ;; *) continue ;; esac
+        drv=none; [ -e $p/driver ] && drv=$(basename "$(readlink $p/driver)")
+        report "nic $(cut -c3- $p/vendor):$(cut -c3- $p/device) class=$(cut -c3-6 $p/class) driver=$drv"
+    done
+    [ -n "$CFG_BASE$CFG_CMDLINE" ] && sayr "device config: base=${CFG_BASE:--} cmdline=${CFG_CMDLINE:--}"
 else
     say "no boot disk with /stage2/manifest found"
 fi
@@ -62,7 +87,7 @@ try_net() {     # $1 = 最多等多少秒
             [ "$i" = lo ] && continue
             ip link set "$i" up 2>/dev/null
             [ "$(cat $d/carrier 2>/dev/null)" = 1 ] || continue
-            say "link up on $i ($(cat $d/address)), DHCP..."
+            sayr "link up on $i ($(cat $d/address)), DHCP..."
             if udhcpc -i "$i" -n -q -t 5 -T 2 -s /etc/udhcpc.sh >/dev/null 2>&1; then NETIF=$i; break; fi
         done
         [ -z "$NETIF" ] && { sleep 1; t=$((t + 1)); }
@@ -70,12 +95,12 @@ try_net() {     # $1 = 最多等多少秒
 }
 try_net $S1_LOCAL_WAIT
 if [ -z "$NETIF" ] && [ -n "$BOOTDISK" ]; then
-    say "no network of our own; ejecting $BOOTDISK to signal the host, waiting for a NIC"
+    sayr "no network (interfaces: $(ls /sys/class/net | tr '\n' ' ')); ejecting $BOOTDISK, waiting ${S1_USBNET_WAIT}s for a NIC"
     s1tool eject $BOOTDISK || say "eject failed"
     try_net $S1_USBNET_WAIT
 fi
 [ -n "$NETIF" ] || fail "no network (interfaces: $(ls /sys/class/net | tr '\n' ' '))"
-say "network: $NETIF $(ip -4 -o addr show dev $NETIF | awk '{print $4}')"
+sayr "network: $NETIF $(ip -4 -o addr show dev $NETIF | awk '{print $4}') gw $(ip route | awk '/^default/{print $3; exit}')"
 
 # ── 第二階段 ──
 # manifest 每行：
@@ -83,6 +108,7 @@ say "network: $NETIF $(ip -4 -o addr show dev $NETIF | awk '{print $4}')"
 #   initrd <sha256> <來源>         一段 initrd，按出現順序首尾相接
 #   rootfs <sha256> <來源>         根文件系統 squashfs：下載後就地包成 cpio（文件名 ramroot.squashfs）當一段 initrd
 #   cmdline <參數…>
+#   base - <地址>                 下載基地址；來源裡的 @BASE@ 換成它。板子配置裡的 base= 優先（換鏡像站不用重做啟動盤，sha256 照樣校驗）
 # <來源> 是 http:// 地址；不帶 :// 的名字先在啟動盤拷出來的 /tmp/stage2/ 裡找，沒有就接在 s1.url= 後面。sha256 寫 - 表示不校驗
 MAN=/tmp/stage2/manifest
 cd /tmp
@@ -91,16 +117,20 @@ if [ ! -f $MAN ]; then
     wget -q -O $MAN "$S1_URL/manifest" || fail "cannot fetch $S1_URL/manifest"
 fi
 
+BASE=$(awk '$1=="base"{print $3; exit}' $MAN)
+[ -n "$CFG_BASE" ] && BASE=$CFG_BASE
 fetch() {       # $1 = sha256 或 -，$2 = 來源，$3 = 輸出文件
     f0=$(cut -d. -f1 /proc/uptime)
-    case "$2" in
-        *://*) wget -q -O $3 "$2" || fail "download $2" ;;
-        *)  if [ -f /tmp/stage2/$2 ]; then mv /tmp/stage2/$2 $3
-            else wget -q -O $3 "$S1_URL/$2" || fail "download $S1_URL/$2"; fi ;;
+    src=$2
+    case "$src" in @BASE@*) src=$BASE${src#@BASE@} ;; esac
+    case "$src" in
+        *://*) report "fetch $src"; wget -q -O $3 "$src" || fail "download $src" ;;
+        *)  if [ -f /tmp/stage2/$src ]; then mv /tmp/stage2/$src $3
+            else wget -q -O $3 "$S1_URL/$src" || fail "download $S1_URL/$src"; fi ;;
     esac
-    [ "$1" = - ] || [ "$(sha256sum < $3 | cut -d' ' -f1)" = "$1" ] || fail "sha256 mismatch: $2"
+    [ "$1" = - ] || [ "$(sha256sum < $3 | cut -d' ' -f1)" = "$1" ] || fail "sha256 mismatch: $src"
     f1=$(( $(cut -d. -f1 /proc/uptime) - f0 )); fk=$(( $(stat -c %s $3) / 1024 ))
-    [ $fk -gt 1024 ] && say "  $(( fk / 1024 )) MB in ${f1} s = $(( fk / (f1 > 0 ? f1 : 1) )) KB/s"
+    [ $fk -gt 1024 ] && sayr "  $(( fk / 1024 )) MB in ${f1} s = $(( fk / (f1 > 0 ? f1 : 1) )) KB/s"
     return 0
 }
 pad4() {        # 多段 initrd 首尾相接時每段必須從 4 字節對齊的偏移開始，否則內核報 invalid magic
@@ -131,7 +161,9 @@ while read kind a b; do
     esac
 done < $MAN
 [ -s kernel ] || fail "manifest has no kernel"
-say "got $(( ($(stat -c %s kernel) + $(stat -c %s initrd)) / 1048576 )) MB in $(( $(cut -d. -f1 /proc/uptime) - T0 )) s, sha256 ok"
+sayr "got $(( ($(stat -c %s kernel) + $(stat -c %s initrd)) / 1048576 )) MB in $(( $(cut -d. -f1 /proc/uptime) - T0 )) s, sha256 ok"
+[ -n "$CFG_CMDLINE" ] && CMDLINE="$CMDLINE $CFG_CMDLINE"
 say "kexec: $CMDLINE"
+report "kexec"
 s1tool kexec kernel initrd "$CMDLINE"
 fail "kexec returned"

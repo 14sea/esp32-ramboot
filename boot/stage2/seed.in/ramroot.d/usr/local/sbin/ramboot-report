@@ -1,0 +1,31 @@
+#!/bin/sh
+# 把信息經啟動盤那塊板子報給主機（主機那邊看到 "* target os …"，或事後用 kvm.py target 讀）。
+# 主機看不到這台機器的屏幕，也未必連得上它的網絡——這是它知道 IP 和硬件情況的途徑。
+#   ramboot-report              系統概況：版本、機器型號、CPU、內存、IP、硬盤。cloud-init 啟動完成時跑一次
+#   ramboot-report run <命令…>  跑一條命令，把輸出（最多 40 行、每行 110 字符）報回去
+T=/usr/local/sbin/s1tool
+dev=
+for d in /sys/block/sd*; do
+    case "$(cat "$d/device/model" 2>/dev/null)" in *"S3 Boot Disk"*) dev=/dev/${d##*/} ;; esac
+done
+[ -n "$dev" ] || { echo "ramboot-report: boot disk board not found" >&2; exit 1; }
+send() { "$T" msg "$dev" "os $*"; sleep 0.05; }
+
+if [ "$1" = run ]; then
+    shift
+    "$@" 2>&1 | head -n 40 | cut -c1-110 | while IFS= read -r l; do send "| $l"; done
+    send "run done: $*"
+    exit 0
+fi
+
+. /etc/os-release
+D=/sys/class/dmi/id
+send "up $PRETTY_NAME kernel $(uname -r)"
+send "hw $(cat $D/sys_vendor 2>/dev/null) / $(cat $D/product_name 2>/dev/null) / bios $(cat $D/bios_version 2>/dev/null)"
+send "cpu $(nproc) x$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo) / mem $(awk '/MemTotal/{printf "%.0f", $2/1048576}' /proc/meminfo) GB"
+if [ -n "$(ip -4 -o addr show scope global)" ]; then
+    ip -4 -o addr show scope global | awk '{print $2, $4}' | while read -r i a; do send "ip $i $a"; done
+else
+    send "ip none"
+fi
+lsblk -dn -o NAME,SIZE,TYPE,TRAN,MODEL | grep -v '^loop' | while IFS= read -r l; do send "disk $l"; done
