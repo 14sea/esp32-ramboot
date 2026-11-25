@@ -33,6 +33,51 @@ static struct {
     uint32_t inquiry, tur, other;       /* 收到的 SCSI 命令數，看主機有沒有在跟啟動盤說話 */
     uint8_t last_other;
 } s_st;
+/*
+ * 追蹤：主機對這塊盤做了什麼。主機那邊看不到目標機的屏幕，「BIOS 讀了哪些扇區」是判斷它在幹什麼的主要線索：
+ * 只讀第 0 扇區 = 傳統 BIOS 在找引導碼；讀分區表和 FAT 但不讀大文件 = 認了盤但沒從它啟動；連續讀幾 MB = 在加載內核。
+ * 連續的讀合併成一條。mtrace 命令讀出來（最近 TRACE_N 條）。
+ */
+#define TRACE_N 96
+static struct { uint32_t ms, lba, n; char op; } s_tr[TRACE_N];
+static volatile uint32_t s_tr_total;
+
+static void trace(char op, uint32_t lba, uint32_t n)
+{
+    uint32_t total = s_tr_total;
+    if (op == 'R' && total) {               /* 接著上一條讀：合併 */
+        uint32_t last = (total - 1) % TRACE_N;
+        if (s_tr[last].op == 'R' && s_tr[last].lba + s_tr[last].n == lba) { s_tr[last].n += n; return; }
+    }
+    uint32_t i = total % TRACE_N;
+    s_tr[i].ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_tr[i].lba = lba;
+    s_tr[i].n = n;
+    s_tr[i].op = op;
+    s_tr_total = total + 1;
+}
+
+/* mtrace         每行 "| <開機毫秒> <操作> …"：M 枚舉完成，I 查詢，R 讀（起始扇區 + 扇區數），W 寫（被拒），
+ *                E 彈出，C 其他 SCSI 命令（操作碼）。TEST UNIT READY 太多，不記
+ * mtrace clear   清空 */
+static void cmd_mtrace(uint32_t seq, const char *cmd, char *args)
+{
+    (void)cmd;
+    if (!strcmp(args, "clear")) { s_tr_total = 0; kvm_cmd_reply(seq, "ok cleared"); return; }
+    uint32_t total = s_tr_total, n = total < TRACE_N ? total : TRACE_N;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t i = (total - n + k) % TRACE_N;
+        char line[64];
+        int len = s_tr[i].op == 'R' || s_tr[i].op == 'W'
+                ? snprintf(line, sizeof(line), "| %" PRIu32 " %c lba=%" PRIu32 " n=%" PRIu32 "\n", s_tr[i].ms, s_tr[i].op, s_tr[i].lba, s_tr[i].n)
+                : s_tr[i].op == 'C'
+                ? snprintf(line, sizeof(line), "| %" PRIu32 " C op=%02" PRIx32 "\n", s_tr[i].ms, s_tr[i].lba)
+                : snprintf(line, sizeof(line), "| %" PRIu32 " %c\n", s_tr[i].ms, s_tr[i].op);
+        kvm_cmd_send(line, (size_t)len);
+    }
+    kvm_cmd_reply(seq, "ok n=%" PRIu32 " total=%" PRIu32 " now_ms=%lld", n, total, esp_timer_get_time() / 1000);
+}
+
 /* 本次枚舉以來讀了多少。主機只是認盤、掃分區表時讀幾百 KB；讀過 1 MB 基本就是固件在加載 Stage-1 的內核 */
 static volatile uint32_t s_mount_bytes;
 #define BOOT_READ_HINT (1024 * 1024)
@@ -58,6 +103,7 @@ void kvm_msc_init(void)
 {
     s_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "bootimg");
     kvm_target_init();
+    kvm_cmd_register("mtrace", cmd_mtrace);
     if (!s_part) { ESP_LOGW(TAG, "沒有 bootimg 分區"); return; }
     kvm_msc_rescan();
 }
@@ -71,7 +117,7 @@ uint32_t kvm_msc_rescan(void)
     return s_blocks;
 }
 
-void kvm_msc_bus_reset(void) { s_ejected = false; s_mount_bytes = 0; }
+void kvm_msc_bus_reset(void) { s_ejected = false; s_mount_bytes = 0; trace('M', 0, 0); }
 
 void kvm_msc_info(char *buf, size_t len)
 {
@@ -91,6 +137,7 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 {
     (void)lun;
     s_st.inquiry++;
+    trace('I', 0, 0);
     memcpy(vendor_id,   "DIY     ", 8);
     memcpy(product_id,  "S3 Boot Disk    ", 16);
     memcpy(product_rev, "0.5 ", 4);
@@ -124,7 +171,7 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
     (void)lun; (void)power_condition;
     if (!load_eject) return true;
     if (start) { s_ejected = false; return true; }
-    if (!s_ejected) kvm_cmd_event("msc eject");
+    if (!s_ejected) { kvm_cmd_event("msc eject"); trace('E', 0, 0); }
     s_ejected = true;
     return true;
 }
@@ -152,6 +199,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
     s_st.last_us = t1;
     s_st.reads++;
     s_st.bytes += bufsize;
+    trace('R', lba, count);
     uint32_t before = s_mount_bytes;
     s_mount_bytes = before + bufsize;
     if (before < BOOT_READ_HINT && before + bufsize >= BOOT_READ_HINT) kvm_cmd_event("msc read_1mb");
@@ -160,7 +208,8 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
 
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
 {
-    (void)lba; (void)offset; (void)buffer; (void)bufsize;
+    (void)offset; (void)buffer;
+    trace('W', lba, bufsize / SECTOR);
     tud_msc_set_sense(lun, SCSI_SENSE_DATA_PROTECT, 0x27, 0x00);            /* WRITE PROTECTED */
     return -1;
 }
@@ -169,6 +218,7 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
 {
     s_st.other++;
     s_st.last_other = scsi_cmd[0];
+    if (scsi_cmd[0] != 0xFB) trace('C', scsi_cmd[0], 0);
     /* 廠商命令：操作碼 FB + 四個字母 */
     if (scsi_cmd[0] == 0xFB) {
         /* BOOT（無數據）：純 U 盤模式下沒有鍵盤燈暗號可用，留一條從目標機重燒的路 */

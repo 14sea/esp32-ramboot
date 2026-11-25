@@ -17,7 +17,7 @@ Status of each task: **open**, **in work**, **done**, or **blocked**.
 The boot sequence was tested only in QEMU with OVMF.
 Real UEFI firmware can be different in these areas:
 
-- The boot disk has a FAT16 partition. The size of 8 MiB is too small for FAT32.
+- The boot disk has an MBR partition table and a FAT16 partition. The size of 8 MiB is too small for FAT32.
 - The device board is a composite USB device (keyboard, mouse, and disk).
 - The UEFI firmware can have a short time limit for a read of the disk.
 - `kexec` and the screen output after `kexec`.

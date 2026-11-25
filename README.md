@@ -12,7 +12,7 @@ A second ESP32-S3 board gives remote control of the first board through Bluetoot
 
 The sequence on the target computer is:
 
-1. The UEFI firmware starts Stage 1 from the USB disk.
+1. The UEFI firmware or the BIOS starts Stage 1 from the USB disk.
    Stage 1 is a Linux kernel with BusyBox (3.4 MB).
 2. Stage 1 gets an IP address through a wired network adapter.
 3. Stage 1 downloads Ubuntu Server (385 MB) and does a check of the SHA-256 values.
@@ -29,7 +29,8 @@ The device board sends this data to the host computer.
   A USB network adapter (ASIX, Realtek, CDC) or a telephone with USB tethering is also satisfactory.
   Stage 1 has no drivers for wireless network adapters.
 - The network must have a DHCP server and access to the download location.
-- The target computer must start in UEFI mode. Secure Boot must be off.
+- The target computer must start from USB in UEFI mode or in BIOS mode. Secure Boot must be off.
+- The target computer must have a 64-bit x86 processor.
 - The target computer must have a minimum of 2 GB of RAM.
 - The host computer gets no data from the screen of the target computer.
 - The boards must have 16 MB of flash memory. The maximum size of the boot disk image is 12 MB.
@@ -142,12 +143,14 @@ The two boards pair at the first connection. The pairing stays in the flash memo
 | `kvm.py mode [hid\|hid+msc\|msc] [save]` | Shows or changes the USB mode |
 | `kvm.py wait <text> [seconds]` | Waits for an event from the device board |
 | `kvm.py target` | Shows the progress data that the target computer sent |
+| `kvm.py mtrace` | Shows which sectors of the boot disk the target computer read |
 | `kvm.py cfg [set key=value \| del key \| clear]` | Shows or changes the configuration for the target computer |
 | `kvm.py log` | Shows the log of the device board |
 | `kvm.py dfu` | Puts the device board into download mode |
 
 The default USB mode is `hid+msc`: keyboard, mouse, and boot disk.
-Use the mode `msc` if the UEFI firmware does not start from the default mode.
+Use the mode `msc` if the target computer does not start from the default mode.
+SeaBIOS (the BIOS of QEMU) starts only from the mode `msc`.
 
 If the link to the host computer stops, the device board releases all keys in 3 seconds.
 
@@ -221,6 +224,7 @@ The author did these tests on 2026-11-25 with two boards and QEMU 8.2:
 - The host computer received the progress, the computer model, the IP address, and the disk list.
 - Stage 1 used the download location from the configuration of the device board.
 - With no network adapter, Stage 1 sent the failure. Commands that the host computer typed sent their output.
+- QEMU with SeaBIOS started Ubuntu Server from the device board in the mode `msc`.
 - The firmware files and the boot disk image contain no paths or names of the host computer.
 
 The author did not do these tests:

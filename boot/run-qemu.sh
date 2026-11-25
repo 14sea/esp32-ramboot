@@ -2,6 +2,7 @@
 # 在 QEMU + OVMF 裡跑整條鏈：UEFI 從「U 盤」啟動 Stage-1 → 下載 → kexec → 內存裡的 Ubuntu（SSH 轉發到本機 2222）
 # 沒有 KVM，純軟件模擬，慢。串口輸出寫到 out/serial.log
 # 環境變量：MEM=4096  NIC=e1000e|virtio-net-pci|none  REAL=<設備端的 USB PID>|port  RESETS=1
+#           BIOS=1 用傳統 BIOS（SeaBIOS）代替 UEFI，測老機器的啟動方式
 cd "$(dirname "$0")"
 R=$PWD/tools/root
 mkdir -p out
@@ -32,10 +33,11 @@ ss -ltn | grep -q "127.0.0.1:8000 " || (cd serve && setsid python3 -m http.serve
 # NIC=none：虛擬機沒有自己的網卡，用來看 Stage-1 在沒網時的行為
 if [ "$NIC" = none ]; then NET_ARGS="-nic none"
 else NET_ARGS="-netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 -device ${NIC:-e1000e},netdev=n0"; fi
+if [ -n "$BIOS" ]; then FW_ARGS=
+else FW_ARGS="-drive if=pflash,format=raw,readonly=on,file=$R/usr/share/OVMF/OVMF_CODE_4M.fd -drive if=pflash,format=raw,file=out/vars.fd"; fi
 exec $R/usr/bin/qemu-system-x86_64 -L $R/usr/share/qemu -L $R/usr/lib/ipxe/qemu -L $R/usr/share/seabios \
   -machine q35 -cpu max -smp 4 -m ${MEM:-4096} \
-  -drive if=pflash,format=raw,readonly=on,file=$R/usr/share/OVMF/OVMF_CODE_4M.fd \
-  -drive if=pflash,format=raw,file=out/vars.fd \
+  $FW_ARGS \
   -device qemu-xhci,id=xhci \
   $STICK_ARGS \
   -drive if=none,id=hd,format=raw,file=out/fakedisk.img -device ide-hd,drive=hd,bus=ide.0 \
