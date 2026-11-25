@@ -10,7 +10,14 @@ mount -t tmpfs -o size=90% tmpfs /tmp
 # 屏幕和串口（調試/虛擬機）都打一份
 say() { echo "[stage1] $*"; echo "[stage1] $*" > /dev/ttyS0; } 2>/dev/null
 # 主機看不到這塊屏幕：關鍵的每一步另外經啟動盤那塊板子報給主機（"* target s1 …"），找到啟動盤之後才報得出去
-report() { [ -n "$BOOTDISK" ] && s1tool msg $BOOTDISK "s1 $*" 2>/dev/null; return 0; }
+# 板子換 USB 身分（比如換成帶網卡的）之後盤符可能變，所以每次按型號現找
+board() {
+    for b in /sys/block/sd*; do
+        case "$(cat $b/device/model 2>/dev/null)" in *"S3 Boot Disk"*) echo /dev/${b##*/}; return 0 ;; esac
+    done
+    return 1
+}
+report() { [ -n "$BOOTDISK" ] && bd=$(board) && s1tool msg $bd "s1 $*" 2>/dev/null; return 0; }
 sayr() { say "$*"; report "$*"; }
 fail() { say "FAILED: $*"; report "FAILED: $*"; say "dropping to shell"; exec setsid cttyhack sh; }
 
@@ -51,7 +58,6 @@ CFG_BASE=
 CFG_CMDLINE=
 if [ -n "$BOOTDISK" ]; then
     say "config copied from $BOOTDISK ($(ls /tmp/stage2 | tr '\n' ' '))"
-    echo $BOOTDISK > /tmp/bootdisk                  # 給 /bin/r 用
     [ -f /tmp/stage2/stage1.conf ] && . /tmp/stage2/stage1.conf
     # 板子裡存的配置（主機經藍牙寫的）：只認下面幾個鍵，當數據讀，不當腳本執行
     s1tool getcfg $BOOTDISK > /tmp/device.conf 2>/dev/null
@@ -95,6 +101,7 @@ try_net() {     # $1 = 最多等多少秒
 }
 try_net $S1_LOCAL_WAIT
 if [ -z "$NETIF" ] && [ -n "$BOOTDISK" ]; then
+    # 彈出只是個信號（設備上報 "msc eject"）：主機可以讓板子換成帶 USB 網卡的身分（kvm.py mode net），或者去插網線
     sayr "no network (interfaces: $(ls /sys/class/net | tr '\n' ' ')); ejecting $BOOTDISK, waiting ${S1_USBNET_WAIT}s for a NIC"
     s1tool eject $BOOTDISK || say "eject failed"
     try_net $S1_USBNET_WAIT

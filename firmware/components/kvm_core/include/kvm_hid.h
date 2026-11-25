@@ -13,7 +13,7 @@ typedef enum {
 
 /* USB 身分：見 kvm_hid.c 開頭 */
 /* 數值存在 NVS 裡（鍵 "usbmode"），不要改順序 */
-typedef enum { KVM_USBMODE_HID, KVM_USBMODE_HID_MSC, KVM_USBMODE_MSC, KVM_USBMODE_COUNT } kvm_usb_mode_t;
+typedef enum { KVM_USBMODE_HID, KVM_USBMODE_HID_MSC, KVM_USBMODE_MSC, KVM_USBMODE_NET, KVM_USBMODE_COUNT } kvm_usb_mode_t;
 
 esp_err_t kvm_hid_start(void);
 
@@ -22,7 +22,7 @@ void kvm_hid_usb_counters(char *buf, size_t len);
 
 kvm_usb_mode_t kvm_hid_mode(void);
 const char *kvm_hid_mode_name(void);
-/* 切換 USB 身分（"hid" | "hid+msc" | "msc"），阻塞約 0.6 秒，目標機看到的是拔掉再插上。
+/* 切換 USB 身分（"hid" | "hid+msc" | "msc" | "net"），阻塞約 0.6 秒，目標機看到的是拔掉再插上。
  * save = 存進 NVS 作為開機模式。未知名字返回 ESP_ERR_NOT_FOUND */
 esp_err_t kvm_hid_set_mode(const char *name, bool save);
 

@@ -1,5 +1,5 @@
 #pragma once
-/* TinyUSB 配置：兩個 HID 接口（Boot 鍵盤 + 絕對座標滑鼠）+ 只讀啟動盤，按模式取捨，跑在 S3 的 OTG 全速口上（GPIO19/20） */
+/* TinyUSB 配置：兩個 HID 接口（Boot 鍵盤 + 絕對座標滑鼠）+ 只讀啟動盤 + USB 網卡，按模式取捨，跑在 S3 的 OTG 全速口上（GPIO19/20） */
 
 #define CFG_TUSB_MCU                OPT_MCU_ESP32S3
 #define CFG_TUSB_OS                 OPT_OS_FREERTOS
@@ -19,7 +19,10 @@
 #define CFG_TUD_HID                 2
 #define CFG_TUD_MIDI                0
 #define CFG_TUD_ECM_RNDIS            0
-#define CFG_TUD_NCM                 0
+#define CFG_TUD_NCM                 1
+/* 每個 NTB 3200 字節裝得下兩個滿幀；多備幾個緩衝，WiFi 來包快於 USB 全速口時少丟 */
+#define CFG_TUD_NCM_IN_NTB_N        3
+#define CFG_TUD_NCM_OUT_NTB_N       2
 #define CFG_TUD_VENDOR              0
 
 #define CFG_TUD_HID_EP_BUFSIZE      16

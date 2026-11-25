@@ -19,6 +19,7 @@
 #include "freertos/task.h"
 #include "kvm_cmd.h"
 #include "kvm_msc.h"
+#include "kvm_net.h"
 #include "nvs.h"
 #include "soc/rtc_cntl_reg.h"
 #include "device/dcd.h"
@@ -41,19 +42,28 @@ static volatile uint8_t s_mbtn;
  *   hid      鍵盤 + 滑鼠
  *   hid+msc  鍵盤 + 滑鼠 + 只讀啟動盤（默認）：要按 F12 選啟動項、再從這塊盤啟動時用
  *   msc      只有啟動盤：給不認複合設備的 BIOS
- * PID 按 esp_tinyusb 的編號規則 0x4000 | MSC 位(2) | HID 位(4)；每種模式不同，主機不會套用舊的緩存。
- * IN 端點硬上限 4 個（不含 EP0）：鍵盤 1 + 滑鼠 1 + 啟動盤 1 = 3，還剩一個。
+ *   net      鍵盤 + 啟動盤 + USB 網卡（CDC-NCM，見 kvm_net.c）：目標機沒有可用網卡時，等它的小系統起來之後換上，
+ *            經這塊板子的 WiFi 上網。沒有滑鼠——端點不夠；啟動盤留著，是為了反饋通道（kvm_target.c）還能用
+ * PID 按 esp_tinyusb 的編號規則 0x4000 | MSC 位(2) | HID 位(4)，網卡自定為 0x10；每種模式不同，主機不會套用舊的緩存。
+ * IN 端點硬上限 4 個（不含 EP0）：鍵盤 1 + 滑鼠 1 + 啟動盤 1 = 3；鍵盤 1 + 啟動盤 1 + 網卡 2 = 4，剛好用滿。
  */
 #define USB_VID 0x303A          /* Espressif VID 僅限自用/測試 */
 
 enum { ITF_NUM_KBD = 0, ITF_NUM_MOUSE, ITF_NUM_HID_TOTAL, ITF_NUM_MSC = ITF_NUM_HID_TOTAL, ITF_NUM_HIDMSC_TOTAL };
-enum { STRID_LANGID = 0, STRID_MANUFACTURER, STRID_PRODUCT, STRID_SERIAL, STRID_KBD, STRID_MOUSE, STRID_MSC };
+enum { ITF_NET_KBD = 0, ITF_NET_MSC, ITF_NET_NCM, ITF_NET_NCM_DATA, ITF_NET_TOTAL };
+enum { STRID_LANGID = 0, STRID_MANUFACTURER, STRID_PRODUCT, STRID_SERIAL, STRID_KBD, STRID_MOUSE, STRID_MSC, STRID_NCM, STRID_NCM_MAC };
 enum { HID_KBD = 0, HID_MOUSE = 1 };   /* TinyUSB 的 HID 實例號，按接口出現順序 */
 
 #define EPNUM_KBD_IN   0x81
 #define EPNUM_MOUSE_IN 0x82
 #define EPNUM_MSC_OUT  0x03
 #define EPNUM_MSC_IN   0x83
+/* net 模式：啟動盤改用滑鼠讓出來的那對端點號，IN 端點號必須在 0x81–0x84 之內 */
+#define EPNUM_NET_MSC_OUT 0x02
+#define EPNUM_NET_MSC_IN  0x82
+#define EPNUM_NCM_NOTIF   0x83
+#define EPNUM_NCM_OUT     0x04
+#define EPNUM_NCM_IN      0x84
 
 static const uint8_t s_report_desc[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
 static const uint8_t s_mouse_desc[]  = { TUD_HID_REPORT_DESC_ABSMOUSE() };
@@ -62,10 +72,12 @@ static const struct { const char *name; uint16_t pid; const char *product; } s_m
     [KVM_USBMODE_HID]     = { "hid",     0x4004, "S3 KVM Keyboard" },
     [KVM_USBMODE_HID_MSC] = { "hid+msc", 0x4006, "S3 KVM Keyboard" },   /* 產品名不變：目標機上按名字找鍵盤的腳本照常用 */
     [KVM_USBMODE_MSC]     = { "msc",     0x4002, "S3 KVM Boot Disk" },
+    [KVM_USBMODE_NET]     = { "net",     0x4016, "S3 KVM Keyboard" },
 };
 /* 沒存過開機模式時帶啟動盤：新板子不經藍牙也能直接拿來啟動 */
 static volatile kvm_usb_mode_t s_mode = KVM_USBMODE_HID_MSC;
 #define MODE_HAS_HID() (s_mode != KVM_USBMODE_MSC)
+#define MODE_HAS_MOUSE() (s_mode == KVM_USBMODE_HID || s_mode == KVM_USBMODE_HID_MSC)
 
 static tusb_desc_device_t s_desc_device = {
     .bLength            = sizeof(tusb_desc_device_t),
@@ -106,11 +118,23 @@ static const uint8_t s_cfg_msc[] = {
     TUD_MSC_DESCRIPTOR(0, STRID_MSC, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
 };
 
+static const uint8_t s_cfg_net[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NET_TOTAL, 0, TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_MSC_DESC_LEN + TUD_CDC_NCM_DESC_LEN, CFG_ATTR, 100),
+    DESC_KBD,
+    TUD_MSC_DESCRIPTOR(ITF_NET_MSC, STRID_MSC, EPNUM_NET_MSC_OUT, EPNUM_NET_MSC_IN, 64),
+    TUD_CDC_NCM_DESCRIPTOR(ITF_NET_NCM, STRID_NCM, STRID_NCM_MAC, EPNUM_NCM_NOTIF, 64, EPNUM_NCM_OUT, EPNUM_NCM_IN, 64, 1514),
+};
+
 static char s_serial[13];
 
 uint8_t const *tud_descriptor_device_cb(void)
 {
-    s_desc_device.idProduct = s_modes[s_mode].pid;      /* 設備類保持 0（由接口決定），老 BIOS 最認這個 */
+    s_desc_device.idProduct = s_modes[s_mode].pid;
+    /* 網卡描述符帶接口關聯（IAD），設備類要報成 Misc/IAD；其餘模式保持 0（由接口決定），老 BIOS 最認這個 */
+    bool iad = s_mode == KVM_USBMODE_NET;
+    s_desc_device.bDeviceClass    = iad ? TUSB_CLASS_MISC : 0;
+    s_desc_device.bDeviceSubClass = iad ? MISC_SUBCLASS_COMMON : 0;
+    s_desc_device.bDeviceProtocol = iad ? MISC_PROTOCOL_IAD : 0;
     return (uint8_t const *)&s_desc_device;
 }
 
@@ -120,6 +144,7 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
     switch (s_mode) {
     case KVM_USBMODE_HID_MSC: return s_cfg_hid_msc;
     case KVM_USBMODE_MSC:     return s_cfg_msc;
+    case KVM_USBMODE_NET:     return s_cfg_net;
     default:                  return s_cfg_hid;
     }
 }
@@ -144,6 +169,8 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
     case STRID_KBD:          str = "S3 KVM Keyboard"; break;
     case STRID_MOUSE:        str = "S3 KVM Mouse"; break;
     case STRID_MSC:          str = "S3 KVM Boot Disk"; break;
+    case STRID_NCM:          str = "S3 KVM Network"; break;
+    case STRID_NCM_MAC:      str = s_serial; break;     /* 主機側網卡 MAC = STA MAC，正好就是序列號那 12 位十六進制 */
     default:                 return NULL;
     }
     size_t n = strlen(str);
@@ -289,6 +316,7 @@ esp_err_t kvm_hid_mouse(uint8_t buttons, uint16_t x, uint16_t y, int8_t wheel)
 {
     if (x > 32767) x = 32767;
     if (y > 32767) y = 32767;
+    if (!MODE_HAS_MOUSE()) return ESP_ERR_NOT_SUPPORTED;        /* 純啟動盤、網卡模式沒有滑鼠 */
     xSemaphoreTake(s_send_lock, portMAX_DELAY);
     esp_err_t err = prepare_locked();
     if (err == ESP_OK && !wait_ready_n(HID_MOUSE, 100)) err = ESP_ERR_TIMEOUT;
@@ -307,7 +335,7 @@ void kvm_hid_release_all(void)
     if (xSemaphoreTake(s_send_lock, pdMS_TO_TICKS(200)) != pdTRUE) return;
     if (MODE_HAS_HID() && tud_mounted() && !tud_suspended()) {
         if (wait_ready(50)) tud_hid_keyboard_report(0, 0, NULL);
-        if (s_mbtn && wait_ready_n(HID_MOUSE, 50)) {      /* 滑鼠按鈕原地放開 */
+        if (s_mbtn && MODE_HAS_MOUSE() && wait_ready_n(HID_MOUSE, 50)) {      /* 滑鼠按鈕原地放開 */
             tud_hid_n_abs_mouse_report(HID_MOUSE, 0, 0, (int16_t)s_mx, (int16_t)s_my, 0, 0);
             s_mbtn = 0;
         }
@@ -359,7 +387,7 @@ esp_err_t kvm_hid_set_mode(const char *name, bool save)
         tud_connect();
     }
     xSemaphoreGive(s_send_lock);
-    if (save) save_mode((kvm_usb_mode_t)m);
+    if (save && m != KVM_USBMODE_NET) save_mode((kvm_usb_mode_t)m);
     return ESP_OK;
 }
 
@@ -417,10 +445,12 @@ esp_err_t kvm_hid_start(void)
 {
     s_send_lock = xSemaphoreCreateMutex();
     kvm_msc_init();
+    kvm_net_init();
     nvs_handle_t h;                 /* 開機模式：上次 "mode … save" 存下的，沒存過就是 hid+msc */
     if (nvs_open("kvm", NVS_READONLY, &h) == ESP_OK) {
         uint8_t m;
-        if (nvs_get_u8(h, "usbmode", &m) == ESP_OK && m < KVM_USBMODE_COUNT) s_mode = (kvm_usb_mode_t)m;
+        /* 網卡模式不作開機模式：它要連 WiFi，而且目標機的固件未必肯從帶網卡的複合設備啟動 */
+        if (nvs_get_u8(h, "usbmode", &m) == ESP_OK && m < KVM_USBMODE_COUNT && m != KVM_USBMODE_NET) s_mode = (kvm_usb_mode_t)m;
         nvs_close(h);
     }
     uint8_t mac[6];

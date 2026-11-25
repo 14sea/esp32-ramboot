@@ -36,6 +36,7 @@
 #include "kvm_keys.h"
 #include "kvm_link.h"
 #include "kvm_msc.h"
+#include "kvm_net.h"
 #include "kvm_proto.h"
 #include "logbuf.h"
 #include "nvs.h"
@@ -382,12 +383,13 @@ static void cmd_caps(uint32_t seq, const char *cmd, char *args)
         strlcat(ext, " ", sizeof(ext));
         strlcat(ext, s_info[i].caps, sizeof(ext));
     }
-    finish(seq, "ok ver=%s kbd=1 mouse=abs msc=ro_flash modes=hid,hid+msc,msc hb_timeout_ms=%d%s",
+    finish(seq, "ok ver=%s kbd=1 mouse=abs msc=ro_flash net=ncm_wifi_bridge modes=hid,hid+msc,msc,net hb_timeout_ms=%d%s",
            KVM_FW_VERSION, KVM_HB_TIMEOUT_MS, ext);
 }
 
-/* mode                          查詢當前 USB 身分和啟動盤統計
- * mode <hid|hid+msc|msc> [save] 切換（目標機看到拔掉再插上）；save = 同時存為開機模式 */
+/* mode                              查詢當前 USB 身分和啟動盤統計
+ * mode <hid|hid+msc|msc|net> [save] 切換（目標機看到拔掉再插上）；save = 同時存為開機模式（net 不能存）
+ * net 會連 WiFi 並開始轉發，離開時關 WiFi；轉發的狀態用 net 命令看 */
 static void cmd_mode(uint32_t seq, const char *cmd, char *args)
 {
     (void)cmd;
@@ -398,8 +400,14 @@ static void cmd_mode(uint32_t seq, const char *cmd, char *args)
         if (opt) { *opt++ = '\0'; while (*opt == ' ') opt++; }
         bool save = opt && strcmp(opt, "save") == 0;
         if (opt && *opt && !save) { finish(seq, "err bad_arg:%s", opt); return; }
+        bool want_net = strcmp(args, "net") == 0;
+        if (!want_net) kvm_net_stop();          /* 先停轉發再換描述符，免得往已經不存在的網卡接口塞包 */
         if (kvm_hid_set_mode(args, save) != ESP_OK) { finish(seq, "err bad_mode:%s", args); return; }
         kvm_msc_rescan();
+        if (want_net) {
+            esp_err_t e = kvm_net_start();
+            if (e != ESP_OK) { finish(seq, "err net:%s%s", esp_err_to_name(e), e == ESP_ERR_NOT_SUPPORTED ? "（固件裡沒有 WiFi 憑據）" : ""); return; }
+        }
     }
     kvm_msc_info(msc, sizeof(msc));
     char cnt[96];

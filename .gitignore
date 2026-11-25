@@ -1,5 +1,7 @@
 # Secrets and local settings
 firmware/components/kvm_common/include/kvm_secrets.h
+firmware/components/kvm_common/include/wifi_secrets.h
+Wifi.txt
 boards.env
 boot/keys/
 

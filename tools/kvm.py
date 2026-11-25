@@ -8,7 +8,10 @@
   kvm.py repeat F12 15000 100        設備本地每 100ms 按一次 F12，持續 15 秒
   kvm.py move X Y | click X Y [left|right|middle] [次數] | scroll N | drag X1 Y1 X2 Y2
                                      絕對座標滑鼠，X Y 是 HID 座標 0–32767
-  kvm.py mode [hid|hid+msc|msc] [save]   查詢/切換 USB 身分（鍵鼠 / 鍵鼠+啟動盤 / 只有啟動盤）；save = 存為開機模式
+  kvm.py mode [hid|hid+msc|msc|net] [save]   查詢/切換 USB 身分（鍵鼠 / 鍵鼠+啟動盤 / 只有啟動盤 / 鍵盤+啟動盤+USB 網卡）
+                                     save = 存為開機模式。net = 目標機經設備的 WiFi 上網（沒有可用網卡的機器用）
+  kvm.py wifi [home|eap]             選設備用哪套 WiFi 憑據（普通網絡 / 企業網絡如 eduroam），切換後 kvm.py reboot 生效
+  kvm.py net                         USB 網卡轉發的狀態和計數
   kvm.py wait <文字> [秒] [--then "<命令>"]    等含這段文字的事件，等到後可緊接著發一條命令
   kvm.py mtrace [clear]              目標機對啟動盤做了什麼（讀了哪些扇區）：看不到屏幕時判斷 BIOS 在幹什麼
   kvm.py target [clear]              目標機報來的進度和信息（Stage-1 的每一步、IP、機器型號……），主機不在線時收到的也在
@@ -234,7 +237,7 @@ def main():
         elif a.cmd in ("move", "click", "scroll", "drag"):
             cmd = a.cmd + " " + " ".join(a.args)
             timeout += 3
-        elif a.cmd in ("target", "cfg", "mtrace"):    # target [clear]；cfg [set key=value | del key | clear]；mtrace [clear]
+        elif a.cmd in ("target", "cfg", "mtrace", "wifi", "net"):    # target [clear]；cfg [set key=value | del key | clear]；mtrace [clear]
             cmd = (a.cmd + " " + " ".join(a.args)).strip()
         elif a.cmd in ("release", "log", "caps", "state", "dfu", "reboot"):
             cmd = a.cmd
