@@ -18,6 +18,12 @@
 #   - BIOS: GRUB in the MBR and the BIOS boot partition, for firmware that goes to BIOS mode when UEFI finds nothing.
 # Progress goes to the screen and, if the board is there, to the host computer.
 set -e
+# Do all mounts in a private mount namespace. Without this, the mounts of the target go into the namespaces of
+# system services (systemd-networkd, systemd-logind, ...) and stay there: the disk is then busy for the next run.
+# The namespace goes away when the script stops, and all its mounts with it.
+if [ -z "$RAMBOOT_NS" ]; then
+    command -v unshare >/dev/null && exec env RAMBOOT_NS=1 unshare -m --propagation private sh "$0" "$@"
+fi
 BOOT_ONLY=
 [ "$1" = --boot-only ] && { BOOT_ONLY=1; shift; }
 DISK=$1; USER_NAME=$2; USER_PW=$3; HOST_NAME=${4:-ubuntu}
