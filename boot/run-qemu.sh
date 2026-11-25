@@ -3,12 +3,14 @@
 # 沒有 KVM，純軟件模擬，慢。串口輸出寫到 out/serial.log
 # 環境變量：MEM=4096  NIC=e1000e|virtio-net-pci|none  REAL=<設備端的 USB PID>|port  RESETS=1
 #           BIOS=1 用傳統 BIOS（SeaBIOS）代替 UEFI，測老機器的啟動方式
+#           HD=<鏡像文件> 換一塊硬盤（默認 out/fakedisk.img）；NOSTICK=1 不掛啟動盤（測「裝好的硬盤自己能不能啟動」）
 cd "$(dirname "$0")"
 R=$PWD/tools/root
 mkdir -p out
 cp -f $R/usr/share/OVMF/OVMF_VARS_4M.fd out/vars.fd
 # 假硬盤：用來驗證「不落盤」——跑前跑後 sha256 應該相同（build.sh 會建）
-[ -f out/fakedisk.img ] || { echo "沒有 out/fakedisk.img，先跑 ./build.sh"; exit 1; }
+HD=${HD:-out/fakedisk.img}
+[ -f "$HD" ] || { echo "沒有 $HD（默認的假硬盤由 ./build.sh 建）"; exit 1; }
 # 啟動盤：默認用鏡像文件；REAL=4006（或 4002）改成直通真實的設備端板子（USB PID，見 kvm.py mode），
 # 需要先裝 scripts/wsl_usb_perms.sh 的 udev 規則
 if [ "$REAL" = port ]; then
@@ -29,6 +31,7 @@ elif [ -n "$REAL" ]; then
 else
     STICK_ARGS="-drive if=none,id=stick,format=raw,readonly=on,file=out/stage1.img -device usb-storage,bus=xhci.0,drive=stick,bootindex=1"
 fi
+[ -n "$NOSTICK" ] && STICK_ARGS=
 ss -ltn | grep -q "127.0.0.1:8000 " || (cd serve && setsid python3 -m http.server 8000 --bind 127.0.0.1 >../out/http.log 2>&1 &)
 # NIC=none：虛擬機沒有自己的網卡，用來看 Stage-1 在沒網時的行為
 if [ "$NIC" = none ]; then NET_ARGS="-nic none"
@@ -40,6 +43,6 @@ exec $R/usr/bin/qemu-system-x86_64 -L $R/usr/share/qemu -L $R/usr/lib/ipxe/qemu 
   $FW_ARGS \
   -device qemu-xhci,id=xhci \
   $STICK_ARGS \
-  -drive if=none,id=hd,format=raw,file=out/fakedisk.img -device ide-hd,drive=hd,bus=ide.0 \
+  -drive if=none,id=hd,format=raw,file=$HD -device ide-hd,drive=hd,bus=ide.0 \
   $NET_ARGS \
   -display none -serial file:out/serial.log -monitor unix:out/qemu.mon,server,nowait "$@"
