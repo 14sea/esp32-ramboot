@@ -1,0 +1,25 @@
+# Secrets and local settings
+firmware/components/kvm_common/include/kvm_secrets.h
+boards.env
+boot/keys/
+
+# ESP-IDF build output
+firmware/*/build/
+firmware/*/sdkconfig
+firmware/*/sdkconfig.old
+firmware/*/managed_components/
+firmware/*/dependencies.lock
+
+# Boot image: downloads, tools, and build output
+boot/build/
+boot/dl/
+boot/tools/
+boot/ubuntu/
+boot/serve/
+boot/out/
+boot/stage1/s1tool
+boot/stage1/initramfs.list
+
+# Python
+__pycache__/
+*.pyc

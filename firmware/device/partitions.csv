@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x5000
+phy_init, data, phy,     0xe000,  0x1000
+factory,  app,  factory, 0x10000, 3M
+# 啟動盤整盤鏡像（boot/out/stage1.img），固件當只讀 U 盤給目標機。12 MB，後面還空約 0.9 MB。
+# 偏移改了的話 scripts/flash_*.sh 裡的 IMG_OFFSET 要跟著改
+bootimg,  data, 0x40,    0x310000, 12M

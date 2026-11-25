@@ -1,0 +1,137 @@
+#!/bin/sh
+# Stage-1：在目標機內存裡 → 從啟動盤拷出配置 → 找網絡（目標機自己的有線網卡）
+#          → 下載第二階段 → 校驗 → kexec。全程不碰硬盤（內核裡根本沒有 SATA/NVMe 驅動）。
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+mount -t tmpfs -o size=90% tmpfs /tmp
+
+# 屏幕和串口（調試/虛擬機）都打一份
+say() { echo "[stage1] $*"; echo "[stage1] $*" > /dev/ttyS0; } 2>/dev/null
+fail() { say "FAILED: $*"; say "dropping to shell"; exec setsid cttyhack sh; }
+
+S1_URL=
+S1_LOCAL_WAIT=12        # 先給目標機自己的網卡這麼多秒
+S1_USBNET_WAIT=180      # 彈出啟動盤之後再等這麼多秒：彈出會讓設備上報 "msc eject" 事件，
+                        # 主機那邊據此知道「目標機沒網」，可以去插網線或換上 USB 網卡
+for a in $(cat /proc/cmdline); do
+    case "$a" in
+        s1.url=*) S1_URL=${a#s1.url=} ;;
+        s1.shell) S1_SHELL=1 ;;
+    esac
+done
+
+say "stage1 $(cat /etc/stage1.version)  kernel $(uname -r)  mem $(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo) MB"
+[ -n "$S1_SHELL" ] && fail "s1.shell requested"
+
+# ── 啟動盤：FAT 分區裡的 /stage2/（manifest、鉤子、種子）拷進內存，之後就不再需要這塊盤 ──
+BOOTDISK=
+mkdir -p /mnt/boot /tmp/stage2
+t=0
+while [ $t -lt 10 ] && [ -z "$BOOTDISK" ]; do
+    for p in /sys/class/block/sd*[0-9]; do
+        [ -e "$p" ] || continue
+        d=${p##*/}
+        if mount -t vfat -o ro /dev/$d /mnt/boot 2>/dev/null; then
+            if [ -f /mnt/boot/stage2/manifest ]; then
+                cp /mnt/boot/stage2/* /tmp/stage2/
+                BOOTDISK=/dev/${d%%[0-9]*}
+            fi
+            umount /mnt/boot
+        fi
+        [ -n "$BOOTDISK" ] && break
+    done
+    [ -z "$BOOTDISK" ] && { sleep 1; t=$((t + 1)); }
+done
+if [ -n "$BOOTDISK" ]; then
+    say "config copied from $BOOTDISK ($(ls /tmp/stage2 | tr '\n' ' '))"
+    [ -f /tmp/stage2/stage1.conf ] && . /tmp/stage2/stage1.conf
+else
+    say "no boot disk with /stage2/manifest found"
+fi
+
+# ── 網絡：每個接口都拉起來，哪個先拿到 DHCP 用哪個 ──
+ip link set lo up
+NETIF=
+try_net() {     # $1 = 最多等多少秒
+    t=0
+    while [ $t -lt $1 ] && [ -z "$NETIF" ]; do
+        for d in /sys/class/net/*; do
+            i=${d##*/}
+            [ "$i" = lo ] && continue
+            ip link set "$i" up 2>/dev/null
+            [ "$(cat $d/carrier 2>/dev/null)" = 1 ] || continue
+            say "link up on $i ($(cat $d/address)), DHCP..."
+            if udhcpc -i "$i" -n -q -t 5 -T 2 -s /etc/udhcpc.sh >/dev/null 2>&1; then NETIF=$i; break; fi
+        done
+        [ -z "$NETIF" ] && { sleep 1; t=$((t + 1)); }
+    done
+}
+try_net $S1_LOCAL_WAIT
+if [ -z "$NETIF" ] && [ -n "$BOOTDISK" ]; then
+    say "no network of our own; ejecting $BOOTDISK to signal the host, waiting for a NIC"
+    s1tool eject $BOOTDISK || say "eject failed"
+    try_net $S1_USBNET_WAIT
+fi
+[ -n "$NETIF" ] || fail "no network (interfaces: $(ls /sys/class/net | tr '\n' ' '))"
+say "network: $NETIF $(ip -4 -o addr show dev $NETIF | awk '{print $4}')"
+
+# ── 第二階段 ──
+# manifest 每行：
+#   kernel <sha256> <來源>         內核
+#   initrd <sha256> <來源>         一段 initrd，按出現順序首尾相接
+#   rootfs <sha256> <來源>         根文件系統 squashfs：下載後就地包成 cpio（文件名 ramroot.squashfs）當一段 initrd
+#   cmdline <參數…>
+# <來源> 是 http:// 地址；不帶 :// 的名字先在啟動盤拷出來的 /tmp/stage2/ 裡找，沒有就接在 s1.url= 後面。sha256 寫 - 表示不校驗
+MAN=/tmp/stage2/manifest
+cd /tmp
+if [ ! -f $MAN ]; then
+    [ -n "$S1_URL" ] || fail "no manifest on boot disk and no s1.url"
+    wget -q -O $MAN "$S1_URL/manifest" || fail "cannot fetch $S1_URL/manifest"
+fi
+
+fetch() {       # $1 = sha256 或 -，$2 = 來源，$3 = 輸出文件
+    f0=$(cut -d. -f1 /proc/uptime)
+    case "$2" in
+        *://*) wget -q -O $3 "$2" || fail "download $2" ;;
+        *)  if [ -f /tmp/stage2/$2 ]; then mv /tmp/stage2/$2 $3
+            else wget -q -O $3 "$S1_URL/$2" || fail "download $S1_URL/$2"; fi ;;
+    esac
+    [ "$1" = - ] || [ "$(sha256sum < $3 | cut -d' ' -f1)" = "$1" ] || fail "sha256 mismatch: $2"
+    f1=$(( $(cut -d. -f1 /proc/uptime) - f0 )); fk=$(( $(stat -c %s $3) / 1024 ))
+    [ $fk -gt 1024 ] && say "  $(( fk / 1024 )) MB in ${f1} s = $(( fk / (f1 > 0 ? f1 : 1) )) KB/s"
+    return 0
+}
+pad4() {        # 多段 initrd 首尾相接時每段必須從 4 字節對齊的偏移開始，否則內核報 invalid magic
+    pad=$(( (4 - $(stat -c %s $1) % 4) % 4 ))
+    [ $pad -gt 0 ] && head -c $pad /dev/zero >> $1
+    return 0
+}
+cpio_hdr() {    # $1 = 文件名，$2 = 大小，$3 = 模式（八進制）：newc 格式的一個表頭
+    n=$(( ${#1} + 1 ))
+    printf '070701%08X%08X%08X%08X%08X%08X%08X%08X%08X%08X%08X%08X%08X%s\0' 0 $((0$3)) 0 0 1 0 $2 0 0 0 0 $n 0 "$1"
+    p=$(( (4 - (110 + n) % 4) % 4 ))
+    [ $p -gt 0 ] && head -c $p /dev/zero
+    return 0
+}
+
+: > initrd
+CMDLINE=
+T0=$(cut -d. -f1 /proc/uptime)
+while read kind a b; do
+    case "$kind" in
+        kernel) say "fetch kernel $b"; fetch "$a" "$b" kernel ;;
+        initrd) say "fetch initrd $b"; fetch "$a" "$b" part; cat part >> initrd; rm part; pad4 initrd ;;
+        rootfs) say "fetch rootfs $b"; fetch "$a" "$b" part
+                cpio_hdr ramroot.squashfs $(stat -c %s part) 100644 >> initrd
+                cat part >> initrd; rm part; pad4 initrd
+                cpio_hdr 'TRAILER!!!' 0 0 >> initrd; pad4 initrd ;;
+        cmdline) CMDLINE="$a $b" ;;
+    esac
+done < $MAN
+[ -s kernel ] || fail "manifest has no kernel"
+say "got $(( ($(stat -c %s kernel) + $(stat -c %s initrd)) / 1048576 )) MB in $(( $(cut -d. -f1 /proc/uptime) - T0 )) s, sha256 ok"
+say "kexec: $CMDLINE"
+s1tool kexec kernel initrd "$CMDLINE"
+fail "kexec returned"

@@ -1,0 +1,11 @@
+#!/bin/sh
+case "$1" in
+    bound|renew)
+        ip addr flush dev $interface
+        ip addr add $ip/${mask:-24} dev $interface
+        [ -n "$router" ] && ip route add default via ${router%% *} dev $interface
+        : > /etc/resolv.conf
+        for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
+        ;;
+    deconfig) ip addr flush dev $interface; ip link set $interface up ;;
+esac
