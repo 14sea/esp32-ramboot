@@ -196,6 +196,10 @@ static void net_task(void *arg)
     s_state = NET_CONNECTING;
     board_wifi_set_hostname_auto("ramboot");
     kvm_ble_set_slow(true);                             /* WiFi 和 BLE 共用一個射頻，BLE 讓一讓 */
+    /* 上一次轉發時停掉了 S3 自己的 DHCP 客戶端（見 set_bridging）；board_wifi_connect 要等拿到地址才算連上，
+     * 不重新打開的話第二次進網卡模式會在這裡超時（實機上遇到過：WiFi 已關聯，20 秒後報 ESP_ERR_TIMEOUT） */
+    esp_netif_t *sta0 = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta0) esp_netif_dhcpc_start(sta0);
     esp_err_t e = board_wifi_connect(20000);
     if (!s_handlers) {                                  /* 要在 board_wifi 建好默認處理函數之後註冊，才排在它們後面 */
         esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, on_wifi_event, NULL);

@@ -4,13 +4,15 @@ Status of each task: **open**, **in work**, **done**, or **blocked**.
 
 | No. | Task | Status |
 |---|---|---|
-| 1 | Test on a real computer | blocked: no target computer at this location |
-| 1a | Test of the download from `cloud-images.ubuntu.com` in Stage 1 | in work: 16 MB of 385 MB tested, 180 kB/s at the test location |
+| 1 | Test on a real computer | done on 2026-11-25 with a Lenovo ThinkCentre M91p. Refer to the task |
+| 1a | Test of the download from `cloud-images.ubuntu.com` in Stage 1 | done on 2026-11-25: 386 MB in 704 s through the device board |
 | 2 | Feedback channel from the target computer to the host computer | done on 2026-11-25 |
 | 3 | Change of the configuration without a new boot disk image | in work: download location, kernel parameters, and wait time are done. The SSH key is open |
 | 4 | Operation with Secure Boot on | open |
-| 5 | Installation of an operating system on the disk of the target computer | open |
-| 6 | Wireless network and download of drivers on demand | blocked: refer to the task |
+| 5 | Installation of an operating system on the disk of the target computer | in work: `tools/install-to-disk.sh` installed Ubuntu Server on the ThinkCentre |
+| 6 | Wireless network and download of drivers on demand | in work: the USB mode `net` is done. Download of drivers on demand is open |
+| 7 | Problems of the USB mode `net` | open |
+| 8 | Stage 2 files from a disk of the target computer | open |
 
 ## 1. Test on a real computer
 
@@ -22,7 +24,18 @@ Real UEFI firmware can be different in these areas:
 - The UEFI firmware can have a short time limit for a read of the disk.
 - `kexec` and the screen output after `kexec`.
 
-Necessary: a target computer with a network cable.
+Results with a Lenovo ThinkCentre M91p (UEFI, no network cable, no screen at the start):
+
+- The firmware did not start a boot disk with GPT and a FAT16 partition. It read only the partition table and
+  the file system data. It started the same files from a disk with an MBR partition table.
+- The firmware started the composite USB device (keyboard, mouse, and disk).
+- `kexec` was correct. Ubuntu Server operated in RAM and reported the hardware through the board.
+- The firmware did not start the installed disk from the entry `ubuntu` or from the removable-media path.
+  It started the disk after the script added a copy of the boot loader at the path of the Windows boot manager
+  and a BIOS boot loader. It is not known which of the two the firmware uses.
+- A system that `kexec` started cannot write UEFI boot entries (`efibootmgr` showed 0 entries).
+
+Open: a test on a computer with BIOS only. QEMU with SeaBIOS is the only BIOS test.
 
 ## 2. Feedback channel
 
@@ -56,3 +69,21 @@ Stage 1 has no drivers for wireless network adapters.
 The ESP32S3CAM project has a USB network adapter mode for the device board.
 With this mode, Stage 1 can download only the drivers that the target computer needs.
 The wireless link of that mode is not stable. This problem must be solved first.
+
+## 7. Problems of the USB mode `net`
+
+- When the host computer sends a key in the mode `net`, the USB network adapter on the target stops.
+  The kernel log of the target shows `usbnet` in `usb_clear_halt`. The keyboard also stops.
+  This occurred on the ThinkCentre (EHCI controller behind a hub), not in QEMU. The cause is not known.
+  At this time, use the mode `hid+msc` to type and the mode `net` for the network.
+- The second start of the mode `net` without a restart of the board failed with a timeout.
+  A correction is in `kvm_net.c`. It was compiled but not tested on a board.
+- The rate through the board is approximately 550 kB/s.
+
+## 8. Stage 2 files from a disk of the target computer
+
+Each start downloads 386 MB. Through the device board, the time is approximately 12 minutes.
+Stage 1 can keep a copy of the three files on a FAT partition of the target computer, for example the EFI
+system partition (512 MiB). At the next start, Stage 1 reads the files from this partition and compares the
+SHA-256 values. Stage 1 must then have drivers for SATA and NVMe disks. At this time it has no disk drivers,
+which makes sure that it does not write to the disks.
