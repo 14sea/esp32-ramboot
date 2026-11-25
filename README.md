@@ -315,6 +315,7 @@ The device board connected to WSL2 through `usbipd`.
 | `mode hid`, then `mode hid+msc` | The target saw the disk again. The SHA-256 value was correct |
 | `dfu`, then installation of the firmware | Correct. The pairing stayed |
 | Download locations at `cloud-images.ubuntu.com` | The three files are available |
+| Search for local data in the firmware files and the boot disk image | No paths, user name, or host name of the build computer |
 
 These tests were not done:
 
@@ -333,3 +334,9 @@ These tests were not done:
 - The serial relay stops when the bridge board disconnects from its USB hub. Start it again.
 - If Stage 1 finds no network, it ejects the boot disk and waits for 180 seconds.
   The device board sends the event `msc eject` to the host computer.
+
+## License
+
+This project has the MIT License. Refer to `LICENSE`.
+The TinyUSB source code in `firmware/components/espressif__tinyusb/` has its own MIT License.
+Refer to the `LICENSE` file in that directory.

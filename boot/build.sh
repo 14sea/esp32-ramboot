@@ -27,13 +27,14 @@ gcc -static -Os -s -o stage1/s1tool stage1/s1tool.c
 stage1/mkinitramfs.sh
 
 echo "==> Stage-1 內核（第一次約 2 分鐘）"
-sed "s|@INITRAMFS_LIST@|$PWD/stage1/initramfs.list|" stage1/kernel.config > build/stage1.config
+# 內核版本字符串裡默認帶「編譯者用戶名@主機名」，換成固定值，鏡像裡不留本機的信息
+export KBUILD_BUILD_USER=ramboot KBUILD_BUILD_HOST=ramboot
 ( cd $K
-  [ -f .config ] && cmp -s ../stage1.config .stage1.config.applied || {
+  [ -f .config ] && cmp -s ../../stage1/kernel.config .stage1.config.applied || {
       make -s ARCH=x86_64 tinyconfig
-      ./scripts/kconfig/merge_config.sh -m .config ../stage1.config >/dev/null
+      ./scripts/kconfig/merge_config.sh -m .config ../../stage1/kernel.config >/dev/null
       make -s ARCH=x86_64 olddefconfig
-      cp ../stage1.config .stage1.config.applied
+      cp ../../stage1/kernel.config .stage1.config.applied
   }
   make -s ARCH=x86_64 -j"$(nproc)" bzImage )
 
