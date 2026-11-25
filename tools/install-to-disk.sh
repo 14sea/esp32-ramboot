@@ -44,6 +44,8 @@ BOARD=$(board) || BOARD=
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -b "$DISK" ] || die "usage: $0 [--boot-only] /dev/sdX user password [hostname]"
 [ "$DISK" != "$BOARD" ] || die "$DISK is the boot disk of the board"
+# A run that stopped before the end can leave the target mounted
+if grep -q " $T " /proc/mounts; then umount -R $T 2>/dev/null || umount -R -l $T; sleep 1; fi
 grep -q "^$DISK" /proc/mounts && die "$DISK is mounted"
 case "$DISK" in *nvme*|*mmcblk*) P=p ;; *) P= ;; esac
 
@@ -113,7 +115,6 @@ sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/ssh
 rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
 EOF
 else
-    # --boot-only: the layout can be the old one (EFI = 1, root = 2) or the current one (bios = 1, EFI = 2, root = 3)
     STEP=mount
     say "start (boot loaders only): disk $DISK"
     ESP=$(lsblk -lnpo NAME,PARTTYPE "$DISK" | awk 'tolower($2)=="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"{print $1; exit}')
@@ -121,14 +122,11 @@ else
     [ -n "$ESP" ] && [ -n "$ROOT" ] || die "no EFI system partition or no ext4 root on $DISK"
     mkdir -p $T && mount "$ROOT" $T && mount "$ESP" $T/boot/efi
     mount_chroot
-    if ! lsblk -lno PARTTYPE "$DISK" | grep -qi 21686148-6449-6e6f-744e-656564454649; then
-        # The first MiB before the first partition is free: put the BIOS boot partition there
-        say "add a BIOS boot partition"
-        printf 'start=34, size=2014, type=21686148-6449-6E6F-744E-656564454649, name=bios\n' | sfdisk -q --append --no-reread --force "$DISK"
-        partx -u "$DISK" 2>/dev/null || partprobe "$DISK" 2>/dev/null || true
-        udevadm settle
-    fi
 fi
+# GRUB for BIOS mode needs a BIOS boot partition on a GPT disk
+BIOS=
+lsblk -lno PARTTYPE "$DISK" | grep -qi 21686148-6449-6e6f-744e-656564454649 && BIOS=1
+[ -n "$BIOS" ] || say "no BIOS boot partition: the disk will start in UEFI mode only"
 
 STEP=download
 say "download the kernel and the boot loaders"
@@ -151,19 +149,18 @@ grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubunt
 mkdir -p /boot/efi/EFI/Microsoft/Boot
 cp /boot/efi/EFI/ubuntu/shimx64.efi /boot/efi/EFI/Microsoft/Boot/bootmgfw.efi
 cp /boot/efi/EFI/ubuntu/grubx64.efi /boot/efi/EFI/ubuntu/mmx64.efi /boot/efi/EFI/Microsoft/Boot/ 2>/dev/null || true
-# BIOS
-grub-install --target=i386-pc "$DISK" >/dev/null 2>&1
+[ -z "$BIOS" ] || grub-install --target=i386-pc "$DISK" >/dev/null 2>&1
 update-grub >/dev/null 2>&1
 EOF
 # BIOS mode on a GPT disk: some firmware starts the disk only if the protective MBR entry has the active flag
-printf '\200' | dd of="$DISK" bs=1 seek=446 conv=notrunc status=none
+[ -z "$BIOS" ] || printf '\200' | dd of="$DISK" bs=1 seek=446 conv=notrunc status=none
 
 STEP=nvram
 # Boot entries in the firmware (only possible if the RAM system started in UEFI mode). Failure here is not fatal
 if [ -d /sys/firmware/efi ]; then
     ESPDEV=$(findmnt -no SOURCE $T/boot/efi); ESPNUM=$(cat /sys/class/block/${ESPDEV##*/}/partition)
     chroot $T sh <<EOF || true
-for n in \$(efibootmgr | sed -n 's/^Boot\([0-9A-F]\{4\}\)[* ] \(ubuntu\|Windows Boot Manager\)\$/\1/p'); do efibootmgr -q -b \$n -B; done
+for n in \$(efibootmgr | sed -n 's/^Boot\([0-9A-F]\{4\}\)[* ] \(ubuntu\|Windows Boot Manager\)\([[:space:]].*\)\{0,1\}\$/\1/p'); do efibootmgr -q -b \$n -B; done
 efibootmgr -q -c -d "$DISK" -p $ESPNUM -L ubuntu -l '\EFI\ubuntu\shimx64.efi'
 efibootmgr -q -c -d "$DISK" -p $ESPNUM -L "Windows Boot Manager" -l '\EFI\ubuntu\shimx64.efi'
 EOF
@@ -174,7 +171,7 @@ STEP=check
 K=$(ls $T/boot/vmlinuz-* 2>/dev/null | tail -1)
 [ -n "$K" ] && [ -s $T/boot/grub/grub.cfg ] && [ -s $T/boot/efi/EFI/BOOT/BOOTX64.EFI ] || die "kernel or boot loader is missing"
 ls $T/boot/initrd.img-* >/dev/null 2>&1 || die "no initrd was made"
-[ -d $T/boot/grub/i386-pc ] || die "no BIOS boot loader"
+[ -z "$BIOS" ] || [ -d $T/boot/grub/i386-pc ] || die "no BIOS boot loader"
 
 STEP=unmount
 sync
