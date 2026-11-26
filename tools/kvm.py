@@ -224,17 +224,41 @@ def tq(k, text):
 
 def agent_wait(k, rid, timeout, on_line, early=()):
     """等 agent 對 rid 的最終回報，返回那一行（去掉 "<id> " 前綴）。期間的輸出行交給 on_line。
-    early：發 tq 期間（回執之前）就收到的事件，先處理"""
+    early：發 tq 期間（回執之前）就收到的事件，先處理。
+    藍牙斷開（@down）時：等重連、重新 hello，再從板子的 target 環形緩衝（最近 48 條）補回斷開期間漏掉的行和最終回報。
+    輸出比環形緩衝長、對不上時，提示可能缺了輸出"""
     pre = f"* target os {rid}"
-    final = []
+    final, seen = [], []
 
     def handle(s):
         if s.startswith(pre + "| "):
-            on_line(s[len(pre) + 2:])
+            seen.append(s[len(pre) + 2:])
+            on_line(seen[-1])
         elif s.startswith(pre + " "):
             final.append(s[len(pre) + 1:])
         else:
             print(s, file=sys.stderr)
+
+    def recover(why):
+        print(f"{why}：鏈路斷開，等重連後從板子補回漏掉的輸出", file=sys.stderr)
+        # 重連和讀緩衝期間到的事件都已經在環形緩衝裡（板子先記緩衝、再發事件，事件和 target 命令同一個隊列）：
+        # 以緩衝為準，這期間的 target 事件不再單獨處理
+        k.on_event = lambda s: None if s.startswith("* target ") else print(s, file=sys.stderr)
+        k.wait_up(60)
+        k.hello()
+        _, _, rows = k.call("target", 15)
+        k.on_event = handle
+        texts = [r.split(" ", 1)[1] for r in rows if " " in r]         # 每行 "<開機秒數> <文本>"
+        out = [t[len(rid) + 5:] for t in texts if t.startswith(f"os {rid}| ")]
+        if out[:len(seen)] == seen:
+            for line in out[len(seen):]:
+                seen.append(line)
+                on_line(line)
+        else:
+            print("（鏈路斷開期間的輸出可能不全：板子只留最近 48 條）", file=sys.stderr)
+        ends = [t[len(rid) + 4:] for t in texts if t.startswith(f"os {rid} ")]
+        if ends and not final:
+            final.append(ends[-1])
 
     for s in early:
         handle(s)
@@ -243,8 +267,12 @@ def agent_wait(k, rid, timeout, on_line, early=()):
     while not final and time.monotonic() < end:
         k.heartbeat()
         s = k.readline(0.3)
-        if s and s.startswith("* "):
+        if not s:
+            continue
+        if s.startswith("* "):
             handle(s)
+        elif s.startswith("@down"):
+            recover(s)
     k.on_event = None
     return final[0] if final else None
 
