@@ -389,11 +389,23 @@ static void cmd_caps(uint32_t seq, const char *cmd, char *args)
 
 /* mode                              查詢當前 USB 身分和啟動盤統計
  * mode <hid|hid+msc|msc|net> [save] 切換（目標機看到拔掉再插上）；save = 同時存為開機模式（net 不能存）
+ * mode next <hid|hid+msc|msc> [秒]  目標機下次重啟時才換（只一次，不存）；給了秒數就在那之後換回來
+ * mode next off                     取消。立即切換也會取消
  * net 會連 WiFi 並開始轉發，離開時關 WiFi；轉發的狀態用 net 命令看 */
 static void cmd_mode(uint32_t seq, const char *cmd, char *args)
 {
     (void)cmd;
-    char msc[260];
+    char msc[260], next[48];
+    if (!strncmp(args, "next", 4) && (args[4] == ' ' || args[4] == '\0')) {
+        char name[16] = "";
+        int back = 0;
+        int n = sscanf(args + 4, "%15s %d", name, &back);
+        esp_err_t e = n >= 1 ? kvm_hid_set_next(name, back) : ESP_ERR_INVALID_ARG;
+        if (e != ESP_OK) { finish(seq, "err usage: mode next <hid|hid+msc|msc> [0-3600] | mode next off"); return; }
+        kvm_hid_next_info(next, sizeof(next));
+        finish(seq, "ok mode=%s %s", kvm_hid_mode_name(), next);
+        return;
+    }
     if (*args) {
         if (s_busy) { finish(seq, "err busy"); return; }
         char *opt = strchr(args, ' ');
@@ -412,7 +424,8 @@ static void cmd_mode(uint32_t seq, const char *cmd, char *args)
     kvm_msc_info(msc, sizeof(msc));
     char cnt[96];
     kvm_hid_usb_counters(cnt, sizeof(cnt));
-    finish(seq, "ok mode=%s usb=%s %s %s", kvm_hid_mode_name(), usb_state_str(), cnt, msc);
+    kvm_hid_next_info(next, sizeof(next));
+    finish(seq, "ok mode=%s usb=%s %s %s %s", kvm_hid_mode_name(), usb_state_str(), next, cnt, msc);
 }
 
 static void cmd_log(uint32_t seq, const char *cmd, char *args)

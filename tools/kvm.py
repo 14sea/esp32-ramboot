@@ -10,6 +10,8 @@
                                      絕對座標滑鼠，X Y 是 HID 座標 0–32767
   kvm.py mode [hid|hid+msc|msc|net] [save]   查詢/切換 USB 身分（鍵鼠 / 鍵鼠+啟動盤 / 只有啟動盤 / 鍵盤+啟動盤+USB 網卡）
                                      save = 存為開機模式。net = 目標機經設備的 WiFi 上網（沒有可用網卡的機器用）
+  kvm.py mode next <hid|hid+msc|msc> [秒] | mode next off
+                                     目標機下次重啟時才換模式（只一次、不存）；給了秒數就在那之後換回來
   kvm.py wifi [home|eap]             選設備用哪套 WiFi 憑據（普通網絡 / 企業網絡如 eduroam），切換後 kvm.py reboot 生效
   kvm.py net                         USB 網卡轉發的狀態和計數
   kvm.py wait <文字> [秒] [--then "<命令>"]    等含這段文字的事件，等到後可緊接著發一條命令

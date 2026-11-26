@@ -238,6 +238,20 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
             ((char *)buffer)[n] = '\0';
             return (int32_t)(n + 1);
         }
+        /* NEXT（數據出）："<模式> [秒]"：目標機要求「下次重啟時換成這個模式」，同主機的 mode next */
+        if (memcmp(&scsi_cmd[1], "NEXT", 4) == 0) {
+            char arg[40], name[16] = "";
+            size_t n = bufsize < sizeof(arg) - 1 ? bufsize : sizeof(arg) - 1;
+            memcpy(arg, buffer, n);
+            arg[n] = '\0';
+            int back = 0;
+            if (sscanf(arg, "%15s %d", name, &back) >= 1 && kvm_hid_set_next(name, back) == ESP_OK) {
+                kvm_cmd_event("usb next armed mode=%s back_s=%d by=target", name, back);
+                return 0;
+            }
+            tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x26, 0x00);  /* INVALID FIELD IN PARAMETER LIST */
+            return -1;
+        }
     }
     tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);         /* INVALID COMMAND OPERATION CODE */
     return -1;

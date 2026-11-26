@@ -5,6 +5,8 @@
  *                                          設備收到後上報 "msc eject" 事件，主機據此知道目標機沒網
  *   s1tool msg /dev/sdX "TEXT"             廠商命令 FB "TMSG"：把一行文本交給啟動盤那塊板子，它經藍牙轉給主機
  *   s1tool getcfg /dev/sdX                 廠商命令 FB "GCFG"：讀板子裡存的配置（key=value 每行一條），打到標準輸出
+ *   s1tool next /dev/sdX "MODE [SECONDS]"  廠商命令 FB "NEXT"：讓板子在這台機器下次重啟時換成 MODE（hid | hid+msc | msc），
+ *                                          只一次；給了 SECONDS 就在那之後換回來。裝完硬盤後用：重啟時不再從板子啟動
  * 進了完整系統之後也用它報告（Stage-2 的種子裡帶一份）。
  * 編譯：gcc -static -Os -s -o s1tool s1tool.c（boot/build.sh 會做）
  */
@@ -79,6 +81,15 @@ static int do_msg(const char *dev, const char *text)
     return vendor(dev, "TMSG", SG_DXFER_TO_DEV, buf, (unsigned)n) < 0;
 }
 
+static int do_next(const char *dev, const char *arg)
+{
+    char buf[40];
+    size_t n = strlen(arg);
+    if (n >= sizeof(buf)) return 1;
+    memcpy(buf, arg, n);
+    return vendor(dev, "NEXT", SG_DXFER_TO_DEV, buf, (unsigned)n) < 0;
+}
+
 static int do_getcfg(const char *dev)
 {
     char buf[1024];
@@ -94,6 +105,7 @@ int main(int argc, char **argv)
     if (argc == 3 && !strcmp(argv[1], "eject")) return do_eject(argv[2]);
     if (argc == 4 && !strcmp(argv[1], "msg")) return do_msg(argv[2], argv[3]);
     if (argc == 3 && !strcmp(argv[1], "getcfg")) return do_getcfg(argv[2]);
-    fprintf(stderr, "usage: s1tool kexec KERNEL INITRD CMDLINE | eject DEV | msg DEV TEXT | getcfg DEV\n");
+    if (argc == 4 && !strcmp(argv[1], "next")) return do_next(argv[2], argv[3]);
+    fprintf(stderr, "usage: s1tool kexec KERNEL INITRD CMDLINE | eject DEV | msg DEV TEXT | getcfg DEV | next DEV \"MODE [SECONDS]\"\n");
     return 2;
 }

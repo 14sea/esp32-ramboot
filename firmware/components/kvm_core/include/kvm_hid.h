@@ -25,6 +25,12 @@ const char *kvm_hid_mode_name(void);
 /* 切換 USB 身分（"hid" | "hid+msc" | "msc" | "net"），阻塞約 0.6 秒，目標機看到的是拔掉再插上。
  * save = 存進 NVS 作為開機模式。未知名字返回 ESP_ERR_NOT_FOUND */
 esp_err_t kvm_hid_set_mode(const char *name, bool save);
+/* 下次目標機重啟（下一次總線復位）時換成 name（"hid" | "hid+msc" | "msc"），只生效一次，不存 NVS。
+ * back_s > 0：生效後這麼多秒換回原來的模式（0–3600）。name 為 "off" 或空：取消。立即切換（kvm_hid_set_mode）也會取消。
+ * 生效時發事件 "* usb next applied …"，換回時 "* usb restored …" */
+esp_err_t kvm_hid_set_next(const char *name, int back_s);
+/* "next=-" 或 "next=<模式> back_s=<秒>" */
+void kvm_hid_next_info(char *buf, size_t len);
 
 kvm_usb_state_t kvm_hid_usb_state(void);
 uint8_t kvm_hid_leds(void);             /* 主機回送的鍵盤燈：bit0 Num, bit1 Caps, bit2 Scroll, bit3 Compose, bit4 Kana */

@@ -185,11 +185,38 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
 /* 總線事件計數：排查「主機換了一個驅動/內核之後設備不應答」時，要知道板子到底有沒有收到復位 */
 static volatile uint32_t s_n_reset, s_n_mount, s_n_setup, s_n_suspend, s_n_resume;
 
+/*
+ * 「下次目標機重啟時換模式」（mode next，或目標機發 SCSI 廠商命令 NEXT）：
+ * 板子自供電，目標機重啟時板子不斷電，看到的只是一次總線復位，之後主機重新枚舉。
+ * 在復位那一刻（中斷裡，事件入隊之後、主機來取描述符之前）換掉模式，固件枚舉時看到的就已經是新身分。
+ * 用途：裝好硬盤之後重啟，優先從 U 盤啟動的固件不會又進 Stage-1；開機模式（NVS）不變。
+ * 只生效一次。back_s > 0 時，生效後再過這麼多秒換回原來的模式（硬盤系統起來後還能用反饋通道和網卡）。
+ * 收尾（停網卡、發事件、到時換回）在 s_next_task 裡做，tud_task() 不返回，不能放在 USB 任務裡。
+ */
+static volatile int8_t s_next = -1;             /* 待生效的模式，-1 = 沒有 */
+static volatile uint16_t s_next_back_s;
+static volatile int8_t s_applied_from = -1;     /* 生效時原來的模式 */
+static volatile uint32_t s_mode_gen;            /* 每次立即切換加一：換回之前有人手動切過，就不換回 */
+static TaskHandle_t s_next_task;
+
 void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr)
 {
-    (void)rhport; (void)in_isr;
+    (void)rhport;
     switch (eventid) {
-    case DCD_EVENT_BUS_RESET:      s_n_reset++; break;
+    case DCD_EVENT_BUS_RESET:
+        s_n_reset++;
+        if (s_next >= 0) {
+            s_applied_from = s_mode;
+            s_mode = (kvm_usb_mode_t)s_next;
+            s_next = -1;
+            s_leds = 0;
+            s_mbtn = 0;
+            if (s_next_task) {
+                if (in_isr) vTaskNotifyGiveFromISR(s_next_task, NULL);
+                else xTaskNotifyGive(s_next_task);
+            }
+        }
+        break;
     case DCD_EVENT_SETUP_RECEIVED: s_n_setup++; break;
     case DCD_EVENT_SUSPEND:        s_n_suspend++; break;
     case DCD_EVENT_RESUME:         s_n_resume++; break;
@@ -377,6 +404,8 @@ esp_err_t kvm_hid_set_mode(const char *name, bool save)
     for (int i = 0; i < KVM_USBMODE_COUNT; i++) if (strcmp(name, s_modes[i].name) == 0) m = i;
     if (m < 0) return ESP_ERR_NOT_FOUND;
     xSemaphoreTake(s_send_lock, portMAX_DELAY);
+    s_next = -1;                /* 立即切換取消待生效的 next（不然下面斷開重連引起的復位就會觸發它） */
+    s_mode_gen++;
     if ((kvm_usb_mode_t)m != s_mode) {
         if (MODE_HAS_HID() && tud_mounted() && !tud_suspended() && wait_ready(50)) tud_hid_keyboard_report(0, 0, NULL);
         tud_disconnect();
@@ -389,6 +418,58 @@ esp_err_t kvm_hid_set_mode(const char *name, bool save)
     xSemaphoreGive(s_send_lock);
     if (save && m != KVM_USBMODE_NET) save_mode((kvm_usb_mode_t)m);
     return ESP_OK;
+}
+
+esp_err_t kvm_hid_set_next(const char *name, int back_s)
+{
+    if (!name || !*name || !strcmp(name, "off")) { s_next = -1; return ESP_OK; }
+    int m = -1;
+    for (int i = 0; i < KVM_USBMODE_COUNT; i++) if (strcmp(name, s_modes[i].name) == 0) m = i;
+    /* net 不能作 next：重啟後的固件階段用不上網卡，而且要先連 WiFi */
+    if (m < 0 || m == KVM_USBMODE_NET) return ESP_ERR_NOT_FOUND;
+    if (back_s < 0 || back_s > 3600) return ESP_ERR_INVALID_ARG;
+    s_next_back_s = (uint16_t)back_s;
+    s_next = (int8_t)m;
+    return ESP_OK;
+}
+
+void kvm_hid_next_info(char *buf, size_t len)
+{
+    int8_t n = s_next;
+    if (n < 0) snprintf(buf, len, "next=-");
+    else snprintf(buf, len, "next=%s back_s=%u", s_modes[n].name, (unsigned)s_next_back_s);
+}
+
+/* 換到 name：和 mode 命令同樣的順序（離開 net 先停轉發，進 net 後才連 WiFi） */
+static void switch_mode(const char *name)
+{
+    bool want_net = strcmp(name, "net") == 0;
+    if (!want_net) kvm_net_stop();
+    kvm_hid_set_mode(name, false);
+    kvm_msc_rescan();
+    if (want_net && kvm_net_start() != ESP_OK) kvm_cmd_event("usb restore err net");
+}
+
+static void next_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        int8_t from = s_applied_from;
+        kvm_usb_mode_t to = s_mode;
+        uint16_t back = s_next_back_s;
+        uint32_t gen = s_mode_gen;
+        if (from < 0) continue;
+        if (from == KVM_USBMODE_NET && to != KVM_USBMODE_NET) kvm_net_stop();     /* 網卡接口已經不在了 */
+        kvm_msc_rescan();
+        kvm_cmd_event("usb next applied mode=%s from=%s back_s=%u", s_modes[to].name, s_modes[from].name, (unsigned)back);
+        if (!back) continue;
+        /* 等 back 秒；期間又一次 next 生效（再收到通知）就按新的那次重新開始 */
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS((uint32_t)back * 1000))) { xTaskNotifyGive(xTaskGetCurrentTaskHandle()); continue; }
+        if (gen != s_mode_gen || s_mode != to) { kvm_cmd_event("usb restore skipped (mode changed)"); continue; }
+        switch_mode(s_modes[from].name);
+        kvm_cmd_event("usb restored mode=%s", s_modes[from].name);
+    }
 }
 
 /* ---------------- 進下載模式 ---------------- */
@@ -444,6 +525,7 @@ static void usb_task(void *arg)
 esp_err_t kvm_hid_start(void)
 {
     s_send_lock = xSemaphoreCreateMutex();
+    if (xTaskCreate(next_task, "usbnext", 3072, NULL, 5, &s_next_task) != pdPASS) return ESP_ERR_NO_MEM;
     kvm_msc_init();
     kvm_net_init();
     nvs_handle_t h;                 /* 開機模式：上次 "mode … save" 存下的，沒存過就是 hid+msc */
