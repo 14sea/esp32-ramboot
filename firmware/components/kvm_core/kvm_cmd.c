@@ -595,7 +595,8 @@ static void handle_line(char *line)
     if (end == line || (*end != ' ' && *end != '\0')) { send_raw("* err bad_line\n"); return; }
     while (*end == ' ') end++;
     char *cmd = end, *args = strchr(cmd, ' ');
-    if (args) { *args++ = '\0'; while (*args == ' ') args++; }
+    /* 命令名後只去掉一個分隔空格給 type：文本開頭的空格是內容（Python、YAML 的縮進） */
+    if (args) { *args++ = '\0'; if (strcmp(cmd, "type") != 0) while (*args == ' ') args++; }
     else args = cmd + strlen(cmd);
 
     if (seq == 0) {             /* 不參與去重 */
