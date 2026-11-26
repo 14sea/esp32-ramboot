@@ -26,7 +26,18 @@ board() {
     done
     return 1
 }
-send() { "$T" msg "$dev" "os $*" 2>/dev/null; sleep 0.05; }
+# Find the board again for each message: when the host changes the USB mode during a command, the name of the
+# disk changes (for example /dev/sdb -> /dev/sdc), and the disk is not there for a few seconds.
+# Try for 15 seconds. If that fails, the next messages of the same command get only one attempt (NOLINK=1).
+send() {
+    n=15; [ -z "$NOLINK" ] || n=1
+    while [ "$n" -gt 0 ]; do
+        if d=$(board) && "$T" msg "$d" "os $*" 2>/dev/null; then NOLINK=; sleep 0.05; return 0; fi
+        n=$((n - 1)); [ "$n" = 0 ] || sleep 1
+    done
+    NOLINK=1
+    return 1
+}
 
 while :; do
     # The name of the disk can change when the board changes its USB mode: find it again each time
@@ -42,6 +53,7 @@ while :; do
     id=${rest%% *}; arg=${rest#* }
     [ "$arg" != "$rest" ] || arg=
     case $id in ''|*[!0-9a-f]*) continue ;; esac      # the id is hexadecimal; it is also a part of file names
+    NOLINK=
     case $verb in
     run)
         ( cd /root 2>/dev/null || cd /; exec timeout "${RAMBOOT_AGENT_TIMEOUT:-3600}" sh -c "$arg" ) </dev/null >"$W/$id.out" 2>&1
