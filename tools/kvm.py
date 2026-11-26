@@ -317,7 +317,7 @@ def wifi_cmds(a):
     """wifi load / set / forget 要發的命令（憑據按十六進制發，空格和引號都不用轉義）。返回 [(命令, 說明)]"""
     hx = lambda s: s.encode("utf-8").hex()
     sub = a.args[0]
-    if sub == "forget":
+    if sub == "forget" and len(a.args) == 2 and a.args[1] in ("home", "eap"):
         return [(f"wifi forget {a.args[1]}", "")]
     if sub == "load":
         path = a.args[1] if len(a.args) > 1 else os.path.join(ROOT, "Wifi.txt")
