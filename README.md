@@ -107,7 +107,7 @@ Attach the device board again each time it starts or changes its USB mode.
 | `kvm.py repeat F12 15000 100` | Pushes F12 each 100 ms for 15 seconds |
 | `kvm.py move X Y`, `click X Y`, `scroll N` | Controls the mouse. X and Y are 0 to 32767 |
 | `kvm.py mode [hid\|hid+msc\|msc\|net]` | Shows or changes the USB mode |
-| `kvm.py mode next <mode> [seconds]` | Changes the USB mode at the next restart of the target computer, one time. After `seconds`, the board goes back to the mode before |
+| `kvm.py mode next <mode> [seconds]` | Changes the USB mode at the next restart of the target computer, one time. After `seconds`, the board goes back to the mode before. `mode next off` or a mode change cancels the two steps. `kvm.py mode` shows the time until the change back |
 | `kvm.py wifi [home\|eap]` | Selects the WiFi data. `eap` is for WPA2-Enterprise |
 | `kvm.py wifi load [Wifi.txt]` | Writes the WiFi data into the NVS of the device board |
 | `kvm.py wifi set home\|eap`, `wifi forget home\|eap` | Writes WiFi data from the keyboard, or removes WiFi data from the NVS |

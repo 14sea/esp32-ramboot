@@ -395,7 +395,7 @@ static void cmd_caps(uint32_t seq, const char *cmd, char *args)
 static void cmd_mode(uint32_t seq, const char *cmd, char *args)
 {
     (void)cmd;
-    char msc[260], next[48];
+    char msc[260], next[80];
     if (!strncmp(args, "next", 4) && (args[4] == ' ' || args[4] == '\0')) {
         char name[16] = "";
         int back = 0;

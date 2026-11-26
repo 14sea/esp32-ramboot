@@ -63,7 +63,9 @@ The sequence of the tasks is the sequence of their importance.
 - `ramboot-agent` with the real `s1tool` on a target computer. The tests on 2026-11-26 used
   `tools/usbfs_target.py` in the place of `s1tool` in WSL2 (no `root` access), and the board firmware 0.12.
 - `mode next` at a real restart of a target computer. The tests used USB/IP detach and attach in WSL2,
-  which make USB bus resets.
+  which make USB bus resets. A real computer can make more than one bus reset during the shutdown and the POST.
+  The first bus reset starts the change: make sure that the change does not occur too early (before the
+  restart), and that 180 seconds are sufficient for the firmware to select the disk.
 
 ## Completed tasks
 

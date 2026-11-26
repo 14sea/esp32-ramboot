@@ -198,6 +198,11 @@ static volatile uint16_t s_next_back_s;
 static volatile int8_t s_applied_from = -1;     /* 生效時原來的模式 */
 static volatile uint32_t s_mode_gen;            /* 每次立即切換加一：換回之前有人手動切過，就不換回 */
 static TaskHandle_t s_next_task;
+/* 給 s_next_task 的通知（按位）：生效了 / 取消正在倒數的換回 */
+#define NEXT_APPLIED 0x1u
+#define NEXT_CANCEL  0x2u
+static volatile int8_t s_restore_to = -1;       /* 正在倒數、到時要換回的模式，-1 = 沒有 */
+static volatile int64_t s_restore_at_us;
 
 void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr)
 {
@@ -212,8 +217,8 @@ void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr)
             s_leds = 0;
             s_mbtn = 0;
             if (s_next_task) {
-                if (in_isr) vTaskNotifyGiveFromISR(s_next_task, NULL);
-                else xTaskNotifyGive(s_next_task);
+                if (in_isr) xTaskNotifyFromISR(s_next_task, NEXT_APPLIED, eSetBits, NULL);
+                else xTaskNotify(s_next_task, NEXT_APPLIED, eSetBits);
             }
         }
         break;
@@ -406,6 +411,10 @@ esp_err_t kvm_hid_set_mode(const char *name, bool save)
     xSemaphoreTake(s_send_lock, portMAX_DELAY);
     s_next = -1;                /* 立即切換取消待生效的 next（不然下面斷開重連引起的復位就會觸發它） */
     s_mode_gen++;
+    if (s_restore_to >= 0) {    /* 也取消正在倒數的換回（gen 已經加過一） */
+        s_restore_to = -1;
+        if (s_next_task) xTaskNotify(s_next_task, NEXT_CANCEL, eSetBits);
+    }
     if ((kvm_usb_mode_t)m != s_mode) {
         if (MODE_HAS_HID() && tud_mounted() && !tud_suspended() && wait_ready(50)) tud_hid_keyboard_report(0, 0, NULL);
         tud_disconnect();
@@ -422,7 +431,16 @@ esp_err_t kvm_hid_set_mode(const char *name, bool save)
 
 esp_err_t kvm_hid_set_next(const char *name, int back_s)
 {
-    if (!name || !*name || !strcmp(name, "off")) { s_next = -1; return ESP_OK; }
+    if (!name || !*name || !strcmp(name, "off")) {      /* 取消待生效的 next，和已經生效、正在倒數的換回 */
+        s_next = -1;
+        if (s_restore_to >= 0) {
+            /* 同步清掉，回執馬上看得到；gen 加一：倒數恰好在這時到期，任務也會跳過換回 */
+            s_restore_to = -1;
+            s_mode_gen++;
+            if (s_next_task) xTaskNotify(s_next_task, NEXT_CANCEL, eSetBits);
+        }
+        return ESP_OK;
+    }
     int m = -1;
     for (int i = 0; i < KVM_USBMODE_COUNT; i++) if (strcmp(name, s_modes[i].name) == 0) m = i;
     /* net 不能作 next：重啟後的固件階段用不上網卡，而且要先連 WiFi */
@@ -435,9 +453,13 @@ esp_err_t kvm_hid_set_next(const char *name, int back_s)
 
 void kvm_hid_next_info(char *buf, size_t len)
 {
-    int8_t n = s_next;
-    if (n < 0) snprintf(buf, len, "next=-");
-    else snprintf(buf, len, "next=%s back_s=%u", s_modes[n].name, (unsigned)s_next_back_s);
+    int8_t n = s_next, r = s_restore_to;
+    int k = n < 0 ? snprintf(buf, len, "next=-")
+                  : snprintf(buf, len, "next=%s back_s=%u", s_modes[n].name, (unsigned)s_next_back_s);
+    if (r >= 0 && k > 0 && (size_t)k < len) {
+        int64_t left = (s_restore_at_us - esp_timer_get_time()) / 1000000;
+        snprintf(buf + k, len - k, " restore=%s in=%llds", s_modes[r].name, left > 0 ? left : 0);
+    }
 }
 
 /* 換到 name：和 mode 命令同樣的順序（離開 net 先停轉發，進 net 後才連 WiFi） */
@@ -453,8 +475,13 @@ static void switch_mode(const char *name)
 static void next_task(void *arg)
 {
     (void)arg;
+    uint32_t bits = 0;
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (!(bits & NEXT_APPLIED)) {
+            xTaskNotifyWait(0, UINT32_MAX, &bits, portMAX_DELAY);
+            if (!(bits & NEXT_APPLIED)) continue;           /* 只有取消：沒有在倒數，不用管 */
+        }
+        bits = 0;
         int8_t from = s_applied_from;
         kvm_usb_mode_t to = s_mode;
         uint16_t back = s_next_back_s;
@@ -464,8 +491,14 @@ static void next_task(void *arg)
         kvm_msc_rescan();
         kvm_cmd_event("usb next applied mode=%s from=%s back_s=%u", s_modes[to].name, s_modes[from].name, (unsigned)back);
         if (!back) continue;
-        /* 等 back 秒；期間又一次 next 生效（再收到通知）就按新的那次重新開始 */
-        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS((uint32_t)back * 1000))) { xTaskNotifyGive(xTaskGetCurrentTaskHandle()); continue; }
+        /* 等 back 秒。期間又一次 next 生效：按新的那次重新開始；mode next off 或立即切換：取消換回 */
+        s_restore_at_us = esp_timer_get_time() + (int64_t)back * 1000000;
+        s_restore_to = from;
+        BaseType_t woke = xTaskNotifyWait(0, UINT32_MAX, &bits, pdMS_TO_TICKS((uint32_t)back * 1000));
+        s_restore_to = -1;
+        if (woke && (bits & NEXT_APPLIED)) continue;
+        if (woke && (bits & NEXT_CANCEL)) { bits = 0; kvm_cmd_event("usb restore cancelled"); continue; }
+        bits = 0;
         if (gen != s_mode_gen || s_mode != to) { kvm_cmd_event("usb restore skipped (mode changed)"); continue; }
         switch_mode(s_modes[from].name);
         kvm_cmd_event("usb restored mode=%s", s_modes[from].name);
