@@ -57,6 +57,11 @@ void board_wifi_set_protocol(uint8_t bitmap);
 void board_wifi_link_info(char *buf, size_t len);
 
 /*
+ * 換普通 WPA2 網絡的憑據，取代 wifi_secrets.h 裡的（例如存在 NVS 裡、經藍牙寫入的）。必須在 connect/scan 之前調用。
+ */
+void board_wifi_set_home(const char *ssid, const char *password);
+
+/*
  * 改連 WPA2-Enterprise 網絡（如 eduroam，PEAP/TTLS + MSCHAPv2，不驗證 CA），
  * 取代 wifi_secrets.h 裡的家用網絡。必須在 connect/scan 之前調用。
  */

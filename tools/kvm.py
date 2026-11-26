@@ -13,6 +13,8 @@
   kvm.py mode next <hid|hid+msc|msc> [秒] | mode next off
                                      目標機下次重啟時才換模式（只一次、不存）；給了秒數就在那之後換回來
   kvm.py wifi [home|eap]             選設備用哪套 WiFi 憑據（普通網絡 / 企業網絡如 eduroam），切換後 kvm.py reboot 生效
+  kvm.py wifi load [Wifi.txt]        把 Wifi.txt 裡的憑據經藍牙存進設備的 NVS（不用重編固件），之後 kvm.py reboot
+  kvm.py wifi set home|eap           同上，憑據從鍵盤輸入（密碼不回顯）；wifi forget home|eap 刪掉
   kvm.py net                         USB 網卡轉發的狀態和計數
   kvm.py run '<命令>' [--timeout 秒]  在目標機上以 root 跑命令、打印輸出、以命令的退出碼退出（要目標機上有 ramboot-agent）
   kvm.py put <本地文件> <目標機路徑> [權限]   把文件傳到目標機（同上，經藍牙 + 啟動盤，約幾 KB/s）
@@ -33,7 +35,9 @@
 """
 import argparse
 import base64
+import getpass
 import hashlib
+import importlib.util
 import os
 import re
 import secrets
@@ -75,7 +79,8 @@ class Kvm:
     # ---- 行 I/O ----
     def send(self, line):
         if self.verbose:
-            print(f">> {line}", file=sys.stderr)
+            shown = re.sub(r"^(\d+ wifi set \w+) .*", r"\1 <憑據不顯示>", line)
+            print(f">> {shown}", file=sys.stderr)
         self.ser.write((line + "\n").encode())
 
     def readline(self, timeout):
@@ -280,6 +285,35 @@ def do_put(k, local, remote, mode, timeout):
     return 0 if r.startswith("put ok") else 1
 
 
+def wifi_cmds(a):
+    """wifi load / set / forget 要發的命令（憑據按十六進制發，空格和引號都不用轉義）。返回 [(命令, 說明)]"""
+    hx = lambda s: s.encode("utf-8").hex()
+    sub = a.args[0]
+    if sub == "forget":
+        return [(f"wifi forget {a.args[1]}", "")]
+    if sub == "load":
+        path = a.args[1] if len(a.args) > 1 else os.path.join(ROOT, "Wifi.txt")
+        spec = importlib.util.spec_from_file_location("gen_wifi_secrets", os.path.join(ROOT, "scripts/gen_wifi_secrets.py"))
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        w = g.parse(path)
+        out = []
+        if w["ssid"]:
+            out.append((f"wifi set home {hx(w['ssid'])} {hx(w['password'])}", "home"))
+        if w["eap_ssid"]:
+            out.append((f"wifi set eap {hx(w['eap_ssid'])} {hx(w['eap_id'])} {hx(w['eap_pw'])}", "eap"))
+        if not out:
+            sys.exit(f"{path} 裡沒讀到憑據")
+        return out
+    if sub == "set" and len(a.args) > 1 and a.args[1] in ("home", "eap"):
+        ssid = input("SSID: ")
+        if a.args[1] == "home":
+            return [(f"wifi set home {hx(ssid)} {hx(getpass.getpass('密碼: '))}", "home")]
+        ident = input("帳號: ")
+        return [(f"wifi set eap {hx(ssid)} {hx(ident)} {hx(getpass.getpass('密碼: '))}", "eap")]
+    sys.exit("用法：kvm.py wifi load [Wifi.txt] | wifi set home|eap | wifi forget home|eap")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default=os.environ.get("KVM_PORT", "/dev/ttyACM0"))
@@ -313,6 +347,13 @@ def main():
             if len(a.args) not in (2, 3):
                 ap.error("用法：put <本地文件> <目標機路徑> [權限，默認 644]")
             return do_put(k, a.args[0], a.args[1], a.args[2] if len(a.args) == 3 else "644", a.timeout)
+        if a.cmd == "wifi" and a.args and a.args[0] in ("load", "set", "forget"):
+            rc = 0
+            for cmd, what in wifi_cmds(a):
+                ok, s, _ = k.call(cmd, 10)
+                print(s)
+                rc |= 0 if ok else 1
+            return rc
 
         timeout = 10.0
         if a.cmd == "type":

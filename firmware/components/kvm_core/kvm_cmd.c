@@ -418,7 +418,7 @@ static void cmd_mode(uint32_t seq, const char *cmd, char *args)
         kvm_msc_rescan();
         if (want_net) {
             esp_err_t e = kvm_net_start();
-            if (e != ESP_OK) { finish(seq, "err net:%s%s", esp_err_to_name(e), e == ESP_ERR_NOT_SUPPORTED ? "（固件裡沒有 WiFi 憑據）" : ""); return; }
+            if (e != ESP_OK) { finish(seq, "err net:%s%s", esp_err_to_name(e), e == ESP_ERR_NOT_SUPPORTED ? "（沒有 WiFi 憑據：kvm.py wifi set / wifi load）" : ""); return; }
         }
     }
     kvm_msc_info(msc, sizeof(msc));

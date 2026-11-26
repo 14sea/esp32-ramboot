@@ -55,9 +55,16 @@ static struct {
     char password[64];
 } s_eap;
 
+/* 運行時給的普通網絡憑據（存在 NVS 裡、經藍牙寫入的）：設了就取代 wifi_secrets.h 裡的 */
+static struct {
+    bool on;
+    char ssid[33];
+    char password[65];
+} s_home;
+
 static const char *active_ssid(void)
 {
-    return s_eap.on ? s_eap.ssid : WIFI_SSID;
+    return s_eap.on ? s_eap.ssid : s_home.on ? s_home.ssid : WIFI_SSID;
 }
 
 /* 快速重試多少次之後，board_wifi_connect 才報失敗返回 */
@@ -218,6 +225,13 @@ static esp_err_t wifi_low_init(void)
                 .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
             },
         };
+        if (s_home.on && !s_eap.on) {
+            /* 和下面同理：先清零再拷（ssid 32 字節、password 64 字節都不要求 \0 結尾） */
+            memset(wc.sta.ssid, 0, sizeof(wc.sta.ssid));
+            memset(wc.sta.password, 0, sizeof(wc.sta.password));
+            memcpy(wc.sta.ssid, s_home.ssid, strnlen(s_home.ssid, sizeof(wc.sta.ssid)));
+            memcpy(wc.sta.password, s_home.password, strnlen(s_home.password, sizeof(wc.sta.password)));
+        }
         if (s_eap.on) {
             memset(wc.sta.password, 0, sizeof(wc.sta.password));
             /* sta.ssid 是 32 字節、不要求 \0 結尾，SSID 最長正好 32。
@@ -422,6 +436,17 @@ const char *board_wifi_ssid_masked(void)
         }
     }
     return masked;
+}
+
+void board_wifi_set_home(const char *ssid, const char *password)
+{
+    if (s_started) {
+        ESP_LOGW(TAG, "WiFi 已啟動，網絡配置被忽略");
+        return;
+    }
+    snprintf(s_home.ssid, sizeof(s_home.ssid), "%s", ssid);
+    snprintf(s_home.password, sizeof(s_home.password), "%s", password);
+    s_home.on = true;
 }
 
 void board_wifi_set_enterprise(const char *ssid, const char *identity,

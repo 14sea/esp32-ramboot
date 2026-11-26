@@ -31,13 +31,11 @@ def c_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def main() -> int:
-    if not SRC.exists():
-        print(f"找不到 {SRC}", file=sys.stderr)
-        return 1
-
+def parse(path) -> dict:
+    """讀 Wifi.txt，返回 {ssid, password, eap_ssid, eap_id, eap_pw}（沒有的是空字符串）。tools/kvm.py wifi load 也用它。"""
+    text = pathlib.Path(path).read_text(encoding="utf-8")
     fields = {}
-    for line in SRC.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         m = re.match(r"^\s*([^:=]+)\s*[:=]\s*(.*?)\s*$", line)
         if m:
             fields[m.group(1).strip().lower()] = m.group(2)
@@ -50,15 +48,24 @@ def main() -> int:
     eap_ssid = strip_quotes(fields.get("eap_ssid", ""))
     eap_id = strip_quotes(fields.get("eap_identity", ""))
     eap_pw = strip_quotes(fields.get("eap_password", ""))
-    bare = [strip_quotes(l.strip()) for l in SRC.read_text(encoding="utf-8").splitlines()
+    bare = [strip_quotes(l.strip()) for l in text.splitlines()
             if l.strip() and not re.match(r"^\s*(ssid|password|eap_\w+)\s*[:=]", l, re.I)]
     if not eap_ssid and len(bare) >= 3:
         eap_ssid, eap_id, eap_pw = bare[0], bare[1], bare[2]
+    return {"ssid": strip_quotes(fields.get("ssid", "")), "password": strip_quotes(fields.get("password", "")),
+            "eap_ssid": eap_ssid, "eap_id": eap_id, "eap_pw": eap_pw}
 
+
+def main() -> int:
+    if not SRC.exists():
+        print(f"找不到 {SRC}", file=sys.stderr)
+        return 1
+
+    w = parse(SRC)
+    ssid, password = w["ssid"], w["password"]
+    eap_ssid, eap_id, eap_pw = w["eap_ssid"], w["eap_id"], w["eap_pw"]
     anon_id = "anonymous@" + eap_id.split("@", 1)[1] if "@" in eap_id else "anonymous"
 
-    ssid = strip_quotes(fields.get("ssid", ""))
-    password = strip_quotes(fields.get("password", ""))
     if not ssid:
         print("Wifi.txt 裡沒讀到 SSID", file=sys.stderr)
         return 1

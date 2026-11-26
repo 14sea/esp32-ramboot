@@ -226,11 +226,24 @@ static void net_task(void *arg)
 }
 
 /*
- * WiFi 配置：home = Wifi.txt 裡的普通網絡；eap = 同一個文件裡的企業網絡段（如 eduroam）。
- * 憑據編譯時寫進固件（wifi_secrets.h），這裡只選用哪一套，存 NVS。board_wifi 的配置只在第一次開 WiFi 時套用一次，
- * 所以切換後要 reboot 才生效。
+ * WiFi 配置：home = 普通 WPA2 網絡；eap = 企業網絡（如 eduroam）。選哪一套存 NVS（"wifiprof"）。
+ * 憑據的來源，先 NVS 後固件：
+ *   - NVS 命名空間 "wifi"：主機經藍牙用 wifi set 寫的（kvm.py wifi set / wifi load）。換網絡不用重編固件
+ *   - wifi_secrets.h：編譯時從 Wifi.txt 生成的，可以沒有
+ * board_wifi 的配置只在第一次開 WiFi 時套用一次，所以改了之後要 reboot 才生效。
+ * 憑據不出現在任何回執和日誌裡，只報來源和長度。
  */
 static uint8_t s_wifi_prof;     /* 0 = home, 1 = eap */
+static const char *s_src_home = "none", *s_src_eap = "none";   /* "nvs" | "fw" | "none" */
+
+#define WNS "wifi"
+
+/* 讀 NVS 裡的一個字符串，沒有就返回 false。buf 至少 len 字節 */
+static bool nvs_str(nvs_handle_t h, const char *key, char *buf, size_t len)
+{
+    size_t n = len;
+    return nvs_get_str(h, key, buf, &n) == ESP_OK && buf[0];
+}
 
 static void load_wifi_profile(void)
 {
@@ -239,31 +252,127 @@ static void load_wifi_profile(void)
         nvs_get_u8(h, "wifiprof", &s_wifi_prof);
         nvs_close(h);
     }
+    char ssid[33] = "", pw[65] = "", id[64] = "";
+    bool nh = false, ne = false;
+    if (nvs_open(WNS, NVS_READONLY, &h) == ESP_OK) {
+        nh = nvs_str(h, "h_ssid", ssid, sizeof(ssid));
+        if (nh) {
+            if (!nvs_str(h, "h_pw", pw, sizeof(pw))) pw[0] = '\0';
+            board_wifi_set_home(ssid, pw);
+        }
+        ne = nvs_str(h, "e_ssid", ssid, sizeof(ssid)) && nvs_str(h, "e_id", id, sizeof(id)) && nvs_str(h, "e_pw", pw, sizeof(pw));
+        if (ne && s_wifi_prof == 1) {
+            /* 外層身分在關聯時明文發送，用匿名的（同 gen_wifi_secrets.py）；真實帳號只在加密隧道裡當內層用戶名 */
+            char anon[80];
+            const char *at = strchr(id, '@');
+            snprintf(anon, sizeof(anon), "anonymous%s", at ? at : "");
+            board_wifi_set_enterprise(ssid, anon, id, pw);
+        }
+        nvs_close(h);
+        memset(pw, 0, sizeof(pw));
+    }
+    s_src_home = nh ? "nvs" : WIFI_SSID[0] ? "fw" : "none";
 #ifdef WIFI_EAP_SSID
-    if (s_wifi_prof == 1) board_wifi_set_enterprise(WIFI_EAP_SSID, WIFI_EAP_ANON_ID, WIFI_EAP_IDENTITY, WIFI_EAP_PASSWORD);
+    s_src_eap = ne ? "nvs" : "fw";
+    if (s_wifi_prof == 1 && !ne) board_wifi_set_enterprise(WIFI_EAP_SSID, WIFI_EAP_ANON_ID, WIFI_EAP_IDENTITY, WIFI_EAP_PASSWORD);
 #else
-    s_wifi_prof = 0;
+    s_src_eap = ne ? "nvs" : "none";
 #endif
+    if (s_wifi_prof == 1 && !strcmp(s_src_eap, "none")) s_wifi_prof = 0;
 }
 
-/* wifi            查詢
- * wifi home|eap   選配置並存下，回執裡 apply=reboot 表示要重啟才生效 */
+/* 十六進制解碼（主機把 SSID、帳號、密碼按十六進制發，空格和任意字節都不用轉義）。成功返回字節數，失敗 -1 */
+static int unhex(const char *s, char *out, size_t max)
+{
+    size_t n = strlen(s);
+    if (n % 2 || n / 2 >= max) return -1;
+    for (size_t i = 0; i < n / 2; i++) {
+        unsigned v;
+        if (sscanf(s + 2 * i, "%2x", &v) != 1) return -1;
+        if (v < 0x20 || v == 0x7f) return -1;           /* 只收可打印字符和 UTF-8 */
+        out[i] = (char)v;
+    }
+    out[n / 2] = '\0';
+    return (int)(n / 2);
+}
+
+static esp_err_t wifi_store(const char *const keys[], const char *const vals[], int n)
+{
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(WNS, NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    for (int i = 0; i < n && e == ESP_OK; i++) {
+        if (vals) e = nvs_set_str(h, keys[i], vals[i]);
+        else if ((e = nvs_erase_key(h, keys[i])) == ESP_ERR_NVS_NOT_FOUND) e = ESP_OK;
+    }
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    return e;
+}
+
+/* wifi set home <ssid 十六進制> <密碼 十六進制>
+ * wifi set eap <ssid 十六進制> <帳號 十六進制> <密碼 十六進制> */
+static void wifi_set(uint32_t seq, char *args)
+{
+    char prof[8] = "", a[136] = "", b[136] = "", c[136] = "";
+    int n = sscanf(args, "%7s %135s %135s %135s", prof, a, b, c);
+    char ssid[33], v1[65], v2[65];
+    esp_err_t e;
+    if (!strcmp(prof, "home") && n == 3) {
+        int ls = unhex(a, ssid, sizeof(ssid)), lp = unhex(b, v1, sizeof(v1));
+        if (ls < 1 || lp < 8) { kvm_cmd_reply(seq, "err bad_arg（SSID 1–32 字節，密碼 8–64 字節）"); return; }
+        static const char *const k[] = { "h_ssid", "h_pw" };
+        const char *const v[] = { ssid, v1 };
+        e = wifi_store(k, v, 2);
+        if (e == ESP_OK) kvm_cmd_reply(seq, "ok wifi set home ssid_len=%d pw_len=%d apply=reboot", ls, lp);
+    } else if (!strcmp(prof, "eap") && n == 4) {
+        int ls = unhex(a, ssid, sizeof(ssid)), li = unhex(b, v1, sizeof(v1) - 1), lp = unhex(c, v2, sizeof(v2) - 1);
+        if (ls < 1 || li < 1 || lp < 1) { kvm_cmd_reply(seq, "err bad_arg（SSID 1–32 字節，帳號、密碼 1–63 字節）"); return; }
+        static const char *const k[] = { "e_ssid", "e_id", "e_pw" };
+        const char *const v[] = { ssid, v1, v2 };
+        e = wifi_store(k, v, 3);
+        if (e == ESP_OK) kvm_cmd_reply(seq, "ok wifi set eap ssid_len=%d id_len=%d pw_len=%d apply=reboot", ls, li, lp);
+    } else {
+        kvm_cmd_reply(seq, "err usage: wifi set home <ssid> <pw> | wifi set eap <ssid> <id> <pw>（十六進制，用 kvm.py wifi set / wifi load）");
+        return;
+    }
+    memset(v1, 0, sizeof(v1));
+    memset(v2, 0, sizeof(v2));
+    memset(args, 0, strlen(args));                      /* 命令行裡的十六進制密碼也別留在內存裡 */
+    if (e != ESP_OK) kvm_cmd_reply(seq, "err nvs:%s", esp_err_to_name(e));
+}
+
+/* wifi                  查詢：選的是哪套、每套憑據的來源（nvs / fw / none）
+ * wifi home|eap         選配置並存下，回執裡 apply=reboot 表示要重啟才生效
+ * wifi set …            把憑據存進 NVS（見 wifi_set），取代固件裡編進去的
+ * wifi forget home|eap  刪掉 NVS 裡的那套（之後用固件裡的，沒有就沒有） */
 static void cmd_wifi(uint32_t seq, const char *cmd, char *args)
 {
     (void)cmd;
-#ifdef WIFI_EAP_SSID
-    const char *avail = "home,eap";
-#else
-    const char *avail = WIFI_SSID[0] ? "home" : "none";
-#endif
-    if (!*args) { kvm_cmd_reply(seq, "ok wifi=%s avail=%s", s_wifi_prof ? "eap" : "home", avail); return; }
+    if (!strncmp(args, "set ", 4)) { wifi_set(seq, args + 4); return; }
+    if (!strncmp(args, "forget ", 7)) {
+        const char *p = args + 7;
+        static const char *const kh[] = { "h_ssid", "h_pw" }, *const ke[] = { "e_ssid", "e_id", "e_pw" };
+        esp_err_t e;
+        if (!strcmp(p, "home")) e = wifi_store(kh, NULL, 2);
+        else if (!strcmp(p, "eap")) e = wifi_store(ke, NULL, 3);
+        else { kvm_cmd_reply(seq, "err usage: wifi forget home|eap"); return; }
+        if (e != ESP_OK) kvm_cmd_reply(seq, "err nvs:%s", esp_err_to_name(e));
+        else kvm_cmd_reply(seq, "ok wifi forget %s apply=reboot", p);
+        return;
+    }
+    if (!*args) {
+        kvm_cmd_reply(seq, "ok wifi=%s home=%s eap=%s", s_wifi_prof ? "eap" : "home", s_src_home, s_src_eap);
+        return;
+    }
     int want = !strcmp(args, "eap") ? 1 : !strcmp(args, "home") ? 0 : -1;
-    if (want < 0 || (want == 1 && strcmp(avail, "home,eap"))) { kvm_cmd_reply(seq, "err bad_arg:%s avail=%s", args, avail); return; }
+    if (want < 0) { kvm_cmd_reply(seq, "err usage: wifi [home|eap] | wifi set … | wifi forget home|eap"); return; }
     nvs_handle_t h;
     if (nvs_open("kvm", NVS_READWRITE, &h) != ESP_OK) { kvm_cmd_reply(seq, "err nvs"); return; }
     nvs_set_u8(h, "wifiprof", (uint8_t)want);
     nvs_commit(h);
     nvs_close(h);
+    /* 憑據也可能是剛用 wifi set 寫的、重啟後才讀到：這裡不因為「現在沒有」而拒絕 */
     kvm_cmd_reply(seq, "ok wifi=%s saved apply=%s", want ? "eap" : "home", want == s_wifi_prof ? "none" : "reboot");
 }
 
@@ -289,7 +398,7 @@ void kvm_net_init(void)
 
 esp_err_t kvm_net_start(void)
 {
-    if (!WIFI_SSID[0] && !s_wifi_prof) return ESP_ERR_NOT_SUPPORTED;    /* 固件裡沒編進 WiFi 憑據 */
+    if (!strcmp(s_wifi_prof ? s_src_eap : s_src_home, "none")) return ESP_ERR_NOT_SUPPORTED;    /* 選的那套沒有憑據 */
     if (s_want) return ESP_OK;
     if (s_task) return ESP_ERR_INVALID_STATE;           /* 上一次的收尾還沒跑完 */
     s_want = true;
