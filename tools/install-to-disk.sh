@@ -6,8 +6,9 @@
 #     install-to-disk.sh --boot-only /dev/sdX                                 install the boot loaders again on a disk
 #                                                                             that this script installed before
 # Options:
-#     --firmware auto|all|none   hardware firmware (default auto). auto: install only the firmware packages for the
-#                                files that the RAM system could not load (dmesg), for example radeon/* -> AMD graphics.
+#     --firmware auto|all|none   hardware firmware (default auto; with --boot-only the default is none).
+#                                auto: install only the firmware packages for the files that the RAM system could not
+#                                load (dmesg), for example radeon/* -> AMD graphics.
 #                                all: all firmware (approximately 700 MB). none: no firmware
 #     --desktop                  also install the GNOME desktop (ubuntu-desktop-minimal, approximately 470 MB),
 #                                without the snap packages (firefox, thunderbird): see the note at the desktop step
@@ -37,7 +38,7 @@ set -e
 if [ -z "$RAMBOOT_NS" ]; then
     command -v unshare >/dev/null && exec env RAMBOOT_NS=1 unshare -m --propagation private sh "$0" "$@"
 fi
-BOOT_ONLY= FIRMWARE=auto DESKTOP= HIDE=1
+BOOT_ONLY= FIRMWARE= DESKTOP= HIDE=1
 while :; do
     case "$1" in
         --boot-only) BOOT_ONLY=1; shift ;;
@@ -47,6 +48,10 @@ while :; do
         *) break ;;
     esac
 done
+# --boot-only installs only the boot loaders again: no firmware, if the operator does not ask for it
+if [ -z "$FIRMWARE" ]; then
+    if [ -n "$BOOT_ONLY" ]; then FIRMWARE=none; else FIRMWARE=auto; fi
+fi
 case "$FIRMWARE" in auto|all|none) ;; *) echo "--firmware: auto, all or none" >&2; exit 1 ;; esac
 DISK=$1; USER_NAME=$2; USER_PW=$3; HOST_NAME=${4:-ubuntu}
 RO=/run/ramroot/ro
@@ -239,9 +244,23 @@ elif [ "$FIRMWARE" = auto ]; then
 fi
 if [ -n "${FW_PKGS% }" ]; then
     say "install firmware: $FW_PKGS"
+    # One package at a time: a package that is not available must not stop the others.
     # Not fatal: the system starts without the firmware (only the hardware does not work)
-    chroot $T sh -c "DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends $FW_PKGS" \
-        || say "firmware installation failed (continue without it)"
+    FW_OK=0
+    for p in $FW_PKGS; do
+        if chroot $T sh -c "DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends $p"; then
+            FW_OK=$((FW_OK + 1))
+        else
+            say "firmware package $p: installation failed (continue without it)"
+        fi
+    done
+    # The kernel package made the initramfs before the firmware was there. A driver in the initramfs (for example
+    # radeon for the early display) needs its firmware in the initramfs: make it again. A firmware package does
+    # not always do this itself
+    if [ "$FW_OK" -gt 0 ]; then
+        chroot $T update-initramfs -u -k all >/dev/null 2>&1 || say "update-initramfs failed (continue)"
+        say "firmware: $FW_OK packages, initramfs updated"
+    fi
 fi
 
 # GNOME desktop. Ubuntu's firefox and thunderbird debs are transitional packages: their preinst downloads a large

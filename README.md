@@ -177,7 +177,8 @@ Example: `kvm.py cfg set "cmdline=ramboot.console=1 ramboot.agent=1"`.
    The script copies the system from RAM and downloads the kernel and the boot loaders (200 MB).
    The options are:
    - `--firmware auto|all|none`: hardware firmware. `auto` (default) installs only the firmware packages
-     for the files that the RAM system could not load.
+     for the files that the RAM system could not load. Then the script makes the initramfs again.
+     With `--boot-only`, the default is `none`.
    - `--desktop`: also install the GNOME desktop (470 MB). The script does not install the snap packages
      `firefox` and `thunderbird`.
    - `--keep-boot-disk`: refer to step 4.
