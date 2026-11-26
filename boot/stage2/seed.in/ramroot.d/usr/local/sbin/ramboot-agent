@@ -1,0 +1,76 @@
+#!/bin/sh
+# ramboot-agent: do what the host sends through the boot disk board (kvm.py run, kvm.py put).
+# It needs no keyboard input and no network.
+#   host -> target: s1tool get (the tq queue of the board)
+#   target -> host: s1tool msg "os <id>..." (the host receives the event "* target os <id>...")
+# Messages from the host:
+#   run <id> <command>          run the command as root with sh -c, send the output and "<id> rc=<n>"
+#   put <id> <mode> <path>      start a file
+#   dat <id> <base64>           a part of the file
+#   end <id> <sha256>           compare the checksum, install the file, send "<id> put ok <bytes>" or "<id> put err <reason>"
+# Only one command runs at a time. A command stops after RAMBOOT_AGENT_TIMEOUT seconds (default 3600).
+# The output is cut into lines of 100 characters. The host gets a maximum of RAMBOOT_AGENT_LINES lines (default 500);
+# if there are more, the full output stays in $W/<id>.out.
+#
+# SECURITY: a person who can control the board through Bluetooth LE can run commands as root on this computer.
+# The service is off by default. The kernel parameter ramboot.agent=1 switches it on (see the dracut hook).
+T=${RAMBOOT_S1TOOL:-/usr/local/sbin/s1tool}
+W=${RAMBOOT_AGENT_DIR:-/run/ramboot-agent}
+LINES=${RAMBOOT_AGENT_LINES:-500}
+mkdir -p "$W" && chmod 700 "$W" || exit 1
+# All expansions of message text below are in double quotes: the shell does not expand * and ? in them
+
+board() {
+    for b in /sys/block/sd*; do
+        case "$(cat "$b/device/model" 2>/dev/null)" in *"S3 Boot Disk"*) echo /dev/${b##*/}; return 0 ;; esac
+    done
+    return 1
+}
+send() { "$T" msg "$dev" "os $*" 2>/dev/null; sleep 0.05; }
+
+while :; do
+    # The name of the disk can change when the board changes its USB mode: find it again each time
+    dev=$(board) || { sleep 5; continue; }
+    m=$("$T" get "$dev" 2>/dev/null)
+    case $? in
+        0) ;;
+        3) sleep 0.2; continue ;;       # the queue is empty
+        *) sleep 2; continue ;;         # an error: the board changes its USB mode, or its firmware is too old
+    esac
+    verb=${m%% *}; rest=${m#* }
+    [ "$rest" != "$m" ] || continue
+    id=${rest%% *}; arg=${rest#* }
+    [ "$arg" != "$rest" ] || arg=
+    case $id in ''|*[!0-9a-f]*) continue ;; esac      # the id is hexadecimal; it is also a part of file names
+    case $verb in
+    run)
+        ( cd /root 2>/dev/null || cd /; exec timeout "${RAMBOOT_AGENT_TIMEOUT:-3600}" sh -c "$arg" ) </dev/null >"$W/$id.out" 2>&1
+        rc=$?
+        n=$(fold -w 100 "$W/$id.out" | wc -l)
+        fold -w 100 "$W/$id.out" | head -n "$LINES" | while IFS= read -r l; do send "$id| $l"; done
+        if [ "$n" -gt "$LINES" ]; then send "$id| ... $n lines; the full output is in $W/$id.out"; else rm -f "$W/$id.out"; fi
+        send "$id rc=$rc"
+        ;;
+    put)
+        printf '%s\n' "$arg" > "$W/$id.put"
+        : > "$W/$id.b64"
+        ;;
+    dat)
+        [ -f "$W/$id.put" ] && printf '%s\n' "$arg" >> "$W/$id.b64"
+        ;;
+    end)
+        if ! read -r mode path < "$W/$id.put" 2>/dev/null; then
+            send "$id put err no put message for this id"
+        elif ! base64 -d "$W/$id.b64" > "$W/$id.bin" 2>/dev/null; then
+            send "$id put err base64"
+        elif [ "$(sha256sum < "$W/$id.bin" | cut -d' ' -f1)" != "$arg" ]; then
+            send "$id put err checksum (parts are missing?)"
+        elif mkdir -p "$(dirname "$path")" && install -m "$mode" "$W/$id.bin" "$path"; then
+            send "$id put ok $(wc -c < "$path") bytes"
+        else
+            send "$id put err install $mode $path"
+        fi
+        rm -f "$W/$id.put" "$W/$id.b64" "$W/$id.bin"
+        ;;
+    esac
+done

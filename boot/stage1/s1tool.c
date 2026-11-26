@@ -5,6 +5,8 @@
  *                                          設備收到後上報 "msc eject" 事件，主機據此知道目標機沒網
  *   s1tool msg /dev/sdX "TEXT"             廠商命令 FB "TMSG"：把一行文本交給啟動盤那塊板子，它經藍牙轉給主機
  *   s1tool getcfg /dev/sdX                 廠商命令 FB "GCFG"：讀板子裡存的配置（key=value 每行一條），打到標準輸出
+ *   s1tool get /dev/sdX                    廠商命令 FB "TGET"：取主機排給這台機器的下一條消息（kvm.py run/put 用），打到標準輸出。
+ *                                          退出碼 0 = 有一條，3 = 隊列空，1 = 出錯（板子上的固件太舊時也是 1）
  *   s1tool next /dev/sdX "MODE [SECONDS]"  廠商命令 FB "NEXT"：讓板子在這台機器下次重啟時換成 MODE（hid | hid+msc | msc），
  *                                          只一次；給了 SECONDS 就在那之後換回來。裝完硬盤後用：重啟時不再從板子啟動
  * 進了完整系統之後也用它報告（Stage-2 的種子裡帶一份）。
@@ -81,6 +83,18 @@ static int do_msg(const char *dev, const char *text)
     return vendor(dev, "TMSG", SG_DXFER_TO_DEV, buf, (unsigned)n) < 0;
 }
 
+static int do_get(const char *dev)
+{
+    char buf[1100];
+    int n = vendor(dev, "TGET", SG_DXFER_FROM_DEV, buf, 1024);
+    if (n < 0) return 1;
+    size_t len = strnlen(buf, (size_t)n);
+    if (!len) return 3;
+    fwrite(buf, 1, len, stdout);
+    putchar('\n');
+    return 0;
+}
+
 static int do_next(const char *dev, const char *arg)
 {
     char buf[40];
@@ -105,7 +119,8 @@ int main(int argc, char **argv)
     if (argc == 3 && !strcmp(argv[1], "eject")) return do_eject(argv[2]);
     if (argc == 4 && !strcmp(argv[1], "msg")) return do_msg(argv[2], argv[3]);
     if (argc == 3 && !strcmp(argv[1], "getcfg")) return do_getcfg(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "get")) return do_get(argv[2]);
     if (argc == 4 && !strcmp(argv[1], "next")) return do_next(argv[2], argv[3]);
-    fprintf(stderr, "usage: s1tool kexec KERNEL INITRD CMDLINE | eject DEV | msg DEV TEXT | getcfg DEV | next DEV \"MODE [SECONDS]\"\n");
+    fprintf(stderr, "usage: s1tool kexec KERNEL INITRD CMDLINE | eject DEV | msg DEV TEXT | getcfg DEV | get DEV | next DEV \"MODE [SECONDS]\"\n");
     return 2;
 }

@@ -1,0 +1,11 @@
+[Unit]
+Description=esp32-ramboot agent: commands and files from the host through the boot disk board
+Documentation=file:///usr/local/sbin/ramboot-agent
+
+[Service]
+ExecStart=/usr/local/sbin/ramboot-agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

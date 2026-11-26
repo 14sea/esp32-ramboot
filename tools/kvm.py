@@ -14,6 +14,9 @@
                                      目標機下次重啟時才換模式（只一次、不存）；給了秒數就在那之後換回來
   kvm.py wifi [home|eap]             選設備用哪套 WiFi 憑據（普通網絡 / 企業網絡如 eduroam），切換後 kvm.py reboot 生效
   kvm.py net                         USB 網卡轉發的狀態和計數
+  kvm.py run '<命令>' [--timeout 秒]  在目標機上以 root 跑命令、打印輸出、以命令的退出碼退出（要目標機上有 ramboot-agent）
+  kvm.py put <本地文件> <目標機路徑> [權限]   把文件傳到目標機（同上，經藍牙 + 啟動盤，約幾 KB/s）
+  kvm.py tq [<文本> | clear]          主機 → 目標機隊列（run / put 用它）的狀態，或直接排一條
   kvm.py wait <文字> [秒] [--then "<命令>"]    等含這段文字的事件，等到後可緊接著發一條命令
   kvm.py mtrace [clear]              目標機對啟動盤做了什麼（讀了哪些扇區）：看不到屏幕時判斷 BIOS 在幹什麼
   kvm.py target [clear]              目標機報來的進度和信息（Stage-1 的每一步、IP、機器型號……），主機不在線時收到的也在
@@ -29,6 +32,8 @@
 等回執期間每秒發心跳；設備有動作在跑時 3 秒收不到任何行會自行中止並放開所有按鍵。
 """
 import argparse
+import base64
+import hashlib
 import os
 import re
 import secrets
@@ -65,6 +70,7 @@ class Kvm:
         self.seq = 0
         self.token = load_token()
         self.last_hb = 0.0
+        self.on_event = None        # 收到 "* …" 事件時調用；None = 打到 stderr
 
     # ---- 行 I/O ----
     def send(self, line):
@@ -157,6 +163,8 @@ class Kvm:
                 return m.group(1) == "ok", s, data
             if s.startswith("| "):
                 data.append(s[2:])
+            elif s.startswith("* ") and self.on_event:
+                self.on_event(s)
             elif s.startswith("* ") or s.startswith("@err"):
                 print(s, file=sys.stderr)
             elif s.startswith("@down"):
@@ -193,6 +201,85 @@ def escape_text(t):
     return t.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
 
 
+# ---- 主機 → 目標機通道（板子的 tq 隊列 + 目標機上的 ramboot-agent，見 boot/stage2/seed.in/…/ramboot-agent）----
+# 排給 agent 的消息：run <id> <命令> | put <id> <權限> <路徑> | dat <id> <base64> | end <id> <sha256>
+# agent 的回報（經 TMSG，主機收到事件 "* target os <id>…"）：<id>| <輸出行> | <id> rc=<n> | <id> put ok <字節> | <id> put err <原因>
+
+def tq(k, text):
+    """排一條；隊列滿就等 agent 取走再發"""
+    end = time.monotonic() + 60
+    while True:
+        ok, s, _ = k.call("tq " + text, 10)
+        if ok:
+            return
+        if "err full" not in s or time.monotonic() > end:
+            raise LinkError(f"tq：{s}")
+        time.sleep(0.3)
+
+
+def agent_wait(k, rid, timeout, on_line, early=()):
+    """等 agent 對 rid 的最終回報，返回那一行（去掉 "<id> " 前綴）。期間的輸出行交給 on_line。
+    early：發 tq 期間（回執之前）就收到的事件，先處理"""
+    pre = f"* target os {rid}"
+    final = []
+
+    def handle(s):
+        if s.startswith(pre + "| "):
+            on_line(s[len(pre) + 2:])
+        elif s.startswith(pre + " "):
+            final.append(s[len(pre) + 1:])
+        else:
+            print(s, file=sys.stderr)
+
+    for s in early:
+        handle(s)
+    k.on_event = handle
+    end = time.monotonic() + timeout
+    while not final and time.monotonic() < end:
+        k.heartbeat()
+        s = k.readline(0.3)
+        if s and s.startswith("* "):
+            handle(s)
+    k.on_event = None
+    return final[0] if final else None
+
+
+def do_run(k, cmdline, timeout):
+    if len(cmdline) > 900:
+        sys.exit("命令太長（最多 900 字符）：長腳本先用 put 傳過去再 run")
+    rid = secrets.token_hex(2)
+    early = []
+    k.on_event = early.append       # agent 可能在 tq 的回執之前就開始回報：先存著，交給 agent_wait
+    tq(k, f"run {rid} {cmdline}")
+    r = agent_wait(k, rid, timeout, lambda l: print(l, flush=True), early)
+    if r is None:
+        print(f"{timeout:.0f} 秒內沒有回報（目標機上沒跑 ramboot-agent？命令還沒結束？）", file=sys.stderr)
+        return 2
+    m = re.match(r"rc=(\d+)", r)
+    return int(m.group(1)) if m else 1
+
+
+def do_put(k, local, remote, mode, timeout):
+    data = open(local, "rb").read()
+    if not remote.startswith("/") or " " in remote:
+        sys.exit("目標機路徑要是不帶空格的絕對路徑")
+    rid = secrets.token_hex(2)
+    t0 = time.monotonic()
+    early = []
+    k.on_event = early.append
+    tq(k, f"put {rid} {mode} {remote}")
+    for i in range(0, len(data), 600):              # 600 字節 → 800 字符的 base64，加前綴後在單行 1024 以內
+        tq(k, f"dat {rid} {base64.b64encode(data[i:i + 600]).decode()}")
+    tq(k, f"end {rid} {hashlib.sha256(data).hexdigest()}")
+    r = agent_wait(k, rid, timeout, lambda l: print(l, flush=True), early)
+    if r is None:
+        print("沒有回報（目標機上沒跑 ramboot-agent？）", file=sys.stderr)
+        return 2
+    dt = time.monotonic() - t0
+    print(f"{r}（{len(data)} 字節，{dt:.1f} 秒，{len(data) / 1024 / dt:.1f} KB/s）")
+    return 0 if r.startswith("put ok") else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", default=os.environ.get("KVM_PORT", "/dev/ttyACM0"))
@@ -202,6 +289,7 @@ def main():
     ap.add_argument("args", nargs="*")
     ap.add_argument("--enter", action="store_true", help="type 結尾補回車")
     ap.add_argument("--then", default="", help="wait 等到事件後緊接著發的命令")
+    ap.add_argument("--timeout", type=float, default=120, help="run / put 等目標機回報的秒數")
     a = ap.parse_args()
 
     k = Kvm(a.port, a.verbose)
@@ -219,6 +307,12 @@ def main():
 
         if a.cmd == "wait":
             return do_wait(k, a)
+        if a.cmd == "run":
+            return do_run(k, " ".join(a.args), a.timeout)
+        if a.cmd == "put":
+            if len(a.args) not in (2, 3):
+                ap.error("用法：put <本地文件> <目標機路徑> [權限，默認 644]")
+            return do_put(k, a.args[0], a.args[1], a.args[2] if len(a.args) == 3 else "644", a.timeout)
 
         timeout = 10.0
         if a.cmd == "type":
@@ -239,7 +333,7 @@ def main():
         elif a.cmd in ("move", "click", "scroll", "drag"):
             cmd = a.cmd + " " + " ".join(a.args)
             timeout += 3
-        elif a.cmd in ("target", "cfg", "mtrace", "wifi", "net"):    # target [clear]；cfg [set key=value | del key | clear]；mtrace [clear]
+        elif a.cmd in ("target", "cfg", "mtrace", "wifi", "net", "tq"):    # target [clear]；cfg [set key=value | del key | clear]；mtrace [clear]
             cmd = (a.cmd + " " + " ".join(a.args)).strip()
         elif a.cmd in ("release", "log", "caps", "state", "dfu", "reboot"):
             cmd = a.cmd

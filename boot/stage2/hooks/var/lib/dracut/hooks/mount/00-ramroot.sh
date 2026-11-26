@@ -17,4 +17,10 @@ if getargbool 0 ramboot.console; then
     printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear %%I $TERM\n' \
         > "$NEWROOT/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 fi
+# 內核參數 ramboot.agent=1：開 ramboot-agent，主機用 kvm.py run / put 經板子跑命令、傳文件（不用打字、不用網絡）。
+# 默認不開，理由同上：能控制板子的人就是 root
+if getargbool 0 ramboot.agent && [ -f "$NEWROOT/etc/systemd/system/ramboot-agent.service" ]; then
+    mkdir -p "$NEWROOT/etc/systemd/system/multi-user.target.wants"
+    ln -sf ../ramboot-agent.service "$NEWROOT/etc/systemd/system/multi-user.target.wants/ramboot-agent.service"
+fi
 info "ramroot: root is squashfs + tmpfs overlay, all in RAM"

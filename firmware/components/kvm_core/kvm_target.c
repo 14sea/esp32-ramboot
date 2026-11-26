@@ -5,6 +5,9 @@
  *                   設備端轉成事件 "* target <文本>" 發給主機，同時留在環形緩衝裡（主機當時不在線也能事後用 target 命令讀）。
  *   GCFG（數據入）  目標機讀一小段配置（key=value 每行一條），主機經藍牙用 cfg 命令寫、存在 NVS 裡。
  *                   換下載地址、加內核參數不用重做啟動盤鏡像。配置的含義由 Stage-1 解釋，設備端只存不看。
+ *   TGET（數據入）  反方向：主機經藍牙用 tq 命令排的消息，目標機上的 ramboot-agent 輪詢取走、執行
+ *                   （跑命令、收文件，輸出經 TMSG 回來）。不用打字、不用網絡。內容由 agent 解釋，設備端只排隊不看。
+ *                   隊列只在內存裡，板子重啟就清空。
  *
  * 主機看不到目標機的屏幕，這是它知道「目標機走到哪一步了」的唯一途徑。
  * 目標機發來的文本一律當數據：只留可打印 ASCII，截到定長，主機那邊不要把它當命令執行。
@@ -14,6 +17,7 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -33,6 +37,10 @@ static struct { uint32_t t; char text[MSG_MAX + 1]; } s_msgs[MSG_N];
 static uint32_t s_msg_total;    /* 開機以來收到的總條數；s_msg_total % MSG_N 是下一條的位置 */
 static char s_cfg[CFG_MAX + 1];
 static SemaphoreHandle_t s_lock;
+
+#define TQ_N      16            /* 主機 → 目標機隊列的條數；滿了 tq 回 err full，主機稍等再發 */
+static char *s_tq[TQ_N];        /* 每條 strdup 出來，取走時釋放 */
+static uint32_t s_tq_head, s_tq_n, s_tq_in, s_tq_out;      /* in/out：開機以來排進/取走的總條數 */
 
 /* ---------------- 來自 USB 任務 ---------------- */
 
@@ -69,7 +77,65 @@ size_t kvm_target_cfg(char *buf, size_t max)
     return n;
 }
 
+size_t kvm_target_tq_pop(char *buf, size_t max)
+{
+    size_t n = 0;
+    char *m = NULL;
+    if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (s_tq_n) {
+            m = s_tq[s_tq_head];
+            s_tq[s_tq_head] = NULL;
+            s_tq_head = (s_tq_head + 1) % TQ_N;
+            s_tq_n--;
+            s_tq_out++;
+        }
+        xSemaphoreGive(s_lock);
+    }
+    if (m) {
+        n = strlen(m);
+        if (n > max) n = max;
+        memcpy(buf, m, n);
+        free(m);
+    }
+    return n;
+}
+
 /* ---------------- 主機命令 ---------------- */
+
+/* tq <文本>     排一條給目標機（ramboot-agent 取走）。回執 n= 隊列裡現有條數；滿了回 err full
+ * tq            隊列狀態：n= in= out=
+ * tq clear      清空 */
+static void cmd_tq(uint32_t seq, const char *cmd, char *args)
+{
+    (void)cmd;
+    if (!*args || !strcmp(args, "clear")) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        if (*args) {
+            for (uint32_t k = 0; k < TQ_N; k++) { free(s_tq[k]); s_tq[k] = NULL; }
+            s_tq_head = s_tq_n = 0;
+        }
+        uint32_t n = s_tq_n, in = s_tq_in, out = s_tq_out;
+        xSemaphoreGive(s_lock);
+        kvm_cmd_reply(seq, "ok n=%" PRIu32 " in=%" PRIu32 " out=%" PRIu32 " max=%d", n, in, out, TQ_N);
+        return;
+    }
+    for (const char *p = args; *p; p++) if (*p < 0x20 || *p >= 0x7f) { kvm_cmd_reply(seq, "err bad_char"); return; }
+    char *m = strdup(args);
+    if (!m) { kvm_cmd_reply(seq, "err no_mem"); return; }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_tq_n == TQ_N) {
+        xSemaphoreGive(s_lock);
+        free(m);
+        kvm_cmd_reply(seq, "err full n=%d", TQ_N);
+        return;
+    }
+    s_tq[(s_tq_head + s_tq_n) % TQ_N] = m;
+    s_tq_n++;
+    s_tq_in++;
+    uint32_t n = s_tq_n;
+    xSemaphoreGive(s_lock);
+    kvm_cmd_reply(seq, "ok n=%" PRIu32, n);
+}
 
 /* target         列出收到的消息（最多最近 MSG_N 條），每行 "| <收到時的開機秒數> <文本>"
  * target clear   清空 */
@@ -202,5 +268,6 @@ void kvm_target_init(void)
     ESP_LOGI(TAG, "目標機配置 %u 字節", (unsigned)strlen(s_cfg));
     kvm_cmd_register("target", cmd_target);
     kvm_cmd_register("cfg", cmd_cfg);
-    kvm_cmd_register_info(NULL, "target_msg=1 cfg=1");
+    kvm_cmd_register("tq", cmd_tq);
+    kvm_cmd_register_info(NULL, "target_msg=1 cfg=1 tq=1 mode_next=1");
 }

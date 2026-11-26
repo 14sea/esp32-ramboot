@@ -238,6 +238,13 @@ int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, u
             ((char *)buffer)[n] = '\0';
             return (int32_t)(n + 1);
         }
+        /* TGET（數據入）：目標機取主機排給它的下一條消息（主機用 tq 命令排）。同樣帶結尾的 0；隊列空時只回 1 字節 0 */
+        if (memcmp(&scsi_cmd[1], "TGET", 4) == 0) {
+            if (bufsize < 2) return -1;
+            size_t n = kvm_target_tq_pop(buffer, bufsize - 1);
+            ((char *)buffer)[n] = '\0';
+            return (int32_t)(n + 1);
+        }
         /* NEXT（數據出）："<模式> [秒]"：目標機要求「下次重啟時換成這個模式」，同主機的 mode next */
         if (memcmp(&scsi_cmd[1], "NEXT", 4) == 0) {
             char arg[40], name[16] = "";
