@@ -2,11 +2,24 @@
 # Install Ubuntu Server from the RAM system to a disk of the target computer.
 #
 # Run this script as root in the Ubuntu Server system that esp32-ramboot started in RAM:
-#     install-to-disk.sh /dev/sdX <user> <password> [hostname]     full installation
-#     install-to-disk.sh --boot-only /dev/sdX                       install the boot loaders again on a disk
-#                                                                   that this script installed before
+#     install-to-disk.sh [options] /dev/sdX <user> <password> [hostname]     full installation
+#     install-to-disk.sh --boot-only /dev/sdX                                 install the boot loaders again on a disk
+#                                                                             that this script installed before
+# Options:
+#     --firmware auto|all|none   hardware firmware (default auto). auto: install only the firmware packages for the
+#                                files that the RAM system could not load (dmesg), for example radeon/* -> AMD graphics.
+#                                all: all firmware (approximately 700 MB). none: no firmware
+#     --desktop                  also install the GNOME desktop (ubuntu-desktop-minimal, approximately 470 MB),
+#                                without the snap packages (firefox, thunderbird): see the note at the desktop step
+#     --keep-boot-disk           do not tell the board to hide its boot disk at the next restart (see the last step)
 #
 # THE FULL INSTALLATION ERASES ALL DATA ON /dev/sdX.
+#
+# The installed system keeps these parts of the RAM system:
+#   - the SSH public key of the boot image (boot/keys/id_ed25519.pub) in ~/.ssh/authorized_keys of <user>
+#   - the feedback tools (s1tool, ramboot-report, r) and ramboot-report.service: after each start, the host
+#     receives the IP address and the hardware data of the computer (kvm.py target)
+#   - ramboot-agent (kvm.py run / put), enabled only if the RAM system started with ramboot.agent=1
 #
 # It copies the read-only Ubuntu Server root file system that is already in RAM (no installer image is necessary),
 # then downloads only the kernel and the boot loaders (approximately 200 MB).
@@ -24,8 +37,17 @@ set -e
 if [ -z "$RAMBOOT_NS" ]; then
     command -v unshare >/dev/null && exec env RAMBOOT_NS=1 unshare -m --propagation private sh "$0" "$@"
 fi
-BOOT_ONLY=
-[ "$1" = --boot-only ] && { BOOT_ONLY=1; shift; }
+BOOT_ONLY= FIRMWARE=auto DESKTOP= HIDE=1
+while :; do
+    case "$1" in
+        --boot-only) BOOT_ONLY=1; shift ;;
+        --firmware) FIRMWARE=$2; shift 2 ;;
+        --desktop) DESKTOP=1; shift ;;
+        --keep-boot-disk) HIDE=; shift ;;
+        *) break ;;
+    esac
+done
+case "$FIRMWARE" in auto|all|none) ;; *) echo "--firmware: auto, all or none" >&2; exit 1 ;; esac
 DISK=$1; USER_NAME=$2; USER_PW=$3; HOST_NAME=${4:-ubuntu}
 RO=/run/ramroot/ro
 T=/mnt/target
@@ -120,6 +142,46 @@ ssh-keygen -A >/dev/null
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
 EOF
+    # The SSH public keys of the boot image: cloud-init gave them to the RAM system from its seed
+    KEYS=$(grep -hoE '(ssh-(ed25519|rsa)|ecdsa-sha2-nistp[0-9]+|sk-[a-z0-9@.-]+) [A-Za-z0-9+/=]+( [^"]*)?' \
+               /var/lib/cloud/seed/nocloud/user-data 2>/dev/null | sort -u)
+    if [ -n "$KEYS" ]; then
+        H=$T/home/$USER_NAME/.ssh
+        mkdir -p "$H" && printf '%s\n' "$KEYS" > "$H/authorized_keys"
+        chmod 700 "$H" && chmod 600 "$H/authorized_keys"
+        chroot $T chown -R "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.ssh"
+        say "SSH keys: $(printf '%s\n' "$KEYS" | wc -l)"
+    else
+        say "no SSH key in the seed: only password login"
+    fi
+    # The feedback tools. They are in the overlay of the RAM system (from the seed), not in $RO
+    for f in /usr/local/sbin/s1tool /usr/local/sbin/ramboot-report /usr/local/sbin/ramboot-agent /usr/local/bin/r \
+             /etc/systemd/system/ramboot-agent.service; do
+        if [ -e "$f" ]; then install -D -m "$(stat -c %a "$f")" "$f" "$T$f"; fi
+    done
+    # Report to the host after each start. The board can hide its boot disk for some time after a restart
+    # (see the last step): try again for 5 minutes
+    cat > $T/etc/systemd/system/ramboot-report.service <<'EOF'
+[Unit]
+Description=esp32-ramboot: report this computer to the host through the boot disk board
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for i in $(seq 60); do /usr/local/sbin/ramboot-report 2>/dev/null && exit 0; sleep 5; done; exit 0'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    mkdir -p $T/etc/systemd/system/multi-user.target.wants
+    if [ -x $T/usr/local/sbin/ramboot-report ]; then
+        ln -sf ../ramboot-report.service $T/etc/systemd/system/multi-user.target.wants/ramboot-report.service
+    fi
+    if [ -f $T/etc/systemd/system/ramboot-agent.service ] && grep -qw 'ramboot.agent=1' /proc/cmdline; then
+        ln -sf ../ramboot-agent.service $T/etc/systemd/system/multi-user.target.wants/ramboot-agent.service
+        say "ramboot-agent: enabled (the RAM system started with ramboot.agent=1)"
+    fi
 else
     STEP=mount
     say "start (boot loaders only): disk $DISK"
@@ -142,6 +204,67 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update
 apt-get -qq install -y --no-install-recommends linux-image-virtual grub-efi-amd64 grub-efi-amd64-signed shim-signed grub-pc-bin
 EOF
+
+# Hardware firmware. linux-image-virtual has the same drivers as linux-image-generic, but no firmware files
+# (linux-image-generic needs all of linux-firmware, approximately 700 MB). Example: on the ThinkCentre M91p the
+# AMD Radeon HD 6450 did not start without radeon/CAICOS_*.bin.
+# auto: find the files that the RAM system (same kernel) could not load, and install the vendor packages for them.
+# Ubuntu 26.04 divides linux-firmware into vendor packages (linux-firmware-amd-graphics, ...).
+fw_pkg() {      # firmware file -> package
+    case "$1" in
+        radeon/*|amdgpu/*) echo linux-firmware-amd-graphics ;;
+        amd/*|amd-ucode/*|amdtee/*) echo linux-firmware-amd-misc ;;
+        i915/*|xe/*) echo linux-firmware-intel-graphics ;;
+        iwlwifi-*|intel/ibt-*|intel/iwlwifi/*) echo linux-firmware-intel-wireless ;;
+        intel/*) echo linux-firmware-intel-misc ;;
+        brcm/*|cypress/*) echo linux-firmware-broadcom-wireless ;;
+        rtl_nic/*|rtlwifi/*|rtw88/*|rtw89/*|rtl_bt/*) echo linux-firmware-realtek ;;
+        mediatek/*|mt7*) echo linux-firmware-mediatek ;;
+        nvidia/*) echo linux-firmware-nvidia-graphics ;;
+        ath9k*|ath10k/*|ath11k/*|ath12k/*|qca/*) echo linux-firmware-qualcomm-wireless ;;
+        mrvl/*|libertas/*) echo linux-firmware-marvell-wireless ;;
+        *) echo linux-firmware-misc ;;
+    esac
+}
+STEP=firmware
+FW_PKGS=
+if [ "$FIRMWARE" = all ]; then
+    FW_PKGS=linux-firmware
+elif [ "$FIRMWARE" = auto ]; then
+    MISSING=$( { dmesg 2>/dev/null || journalctl -k -b 2>/dev/null; } |
+               sed -n 's/.*Direct firmware load for \([^ ]*\) failed.*/\1/p; s/.*firmware: failed to load \([^ ]*\).*/\1/p' | sort -u)
+    for f in $MISSING; do FW_PKGS="$FW_PKGS $(fw_pkg "$f")"; done
+    FW_PKGS=$(printf '%s\n' $FW_PKGS | sort -u | tr '\n' ' ')
+    [ -z "$MISSING" ] || say "missing firmware: $(printf '%s\n' $MISSING | wc -l) files ($(printf '%s ' $MISSING | cut -c1-60))"
+fi
+if [ -n "${FW_PKGS% }" ]; then
+    say "install firmware: $FW_PKGS"
+    # Not fatal: the system starts without the firmware (only the hardware does not work)
+    chroot $T sh -c "DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends $FW_PKGS" \
+        || say "firmware installation failed (continue without it)"
+fi
+
+# GNOME desktop. Ubuntu's firefox and thunderbird debs are transitional packages: their preinst downloads a large
+# snap while dpkg waits. Through the board (approximately 550 kB/s) this took more than 10 minutes, and an
+# interruption left dpkg with firefox in the state iHR. In ubuntu-desktop-minimal, firefox is only "Recommends":
+# a pin with priority -1 keeps these packages out and does not break the installation.
+if [ -n "$DESKTOP" ]; then
+    STEP=desktop
+    say "install the GNOME desktop (ubuntu-desktop-minimal, approximately 470 MB)"
+    cat > $T/etc/apt/preferences.d/ramboot-no-snap-transitional <<'EOF'
+# Written by esp32-ramboot install-to-disk.sh: these debs only download a snap in their preinst.
+# Install the browser later, for example "snap install firefox", or remove this file.
+Package: firefox thunderbird chromium-browser
+Pin: release *
+Pin-Priority: -1
+EOF
+    chroot $T sh -e <<'EOF'
+export DEBIAN_FRONTEND=noninteractive
+apt-get -qq install -y -o DPkg::Lock::Timeout=600 ubuntu-desktop-minimal
+EOF
+    # A desktop computer gets its network from NetworkManager; keep the netplan file for the server interfaces
+    say "desktop installed"
+fi
 
 STEP=bootloader
 say "install the boot loaders"
@@ -183,5 +306,13 @@ STEP=unmount
 sync
 umount -R $T 2>/dev/null || umount -R -l $T
 sync
+# Firmware that gives priority to USB disks would start Stage 1 again at the next restart. Tell the board to hide
+# its boot disk at the next restart (one time; the saved boot mode of the board does not change), and to show it
+# again after 180 seconds: then the installed system can use the feedback tools.
+# Board firmware older than 0.12 does not know this command: then remove the board or use "kvm.py mode hid".
 STEP=done
-say "done: kernel ${K##*/vmlinuz-}. Remove the boot disk of the board and start the computer again."
+MSG="Remove the boot disk of the board and start the computer again."
+if [ -n "$HIDE" ] && [ -x /usr/local/sbin/s1tool ] && b=$(board) && /usr/local/sbin/s1tool next "$b" "hid 180" 2>/dev/null; then
+    MSG="Start the computer again: the board hides its boot disk at the restart (for 180 seconds)."
+fi
+say "done: kernel ${K##*/vmlinuz-}. $MSG"
